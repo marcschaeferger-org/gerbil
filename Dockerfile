@@ -1,4 +1,4 @@
-FROM golang:1.25-alpine AS builder
+FROM golang:1.26-alpine AS builder
 
 # Set the working directory inside the container
 WORKDIR /app
@@ -16,7 +16,7 @@ COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build -o /gerbil
 
 # Start a new stage from scratch
-FROM alpine:3.22 AS runner
+FROM alpine:3.23 AS runner
 
 RUN apk add --no-cache iptables iproute2
 
