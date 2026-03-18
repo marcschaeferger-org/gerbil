@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"runtime"
 	"sync"
 	"time"
 
@@ -167,7 +168,7 @@ func NewUDPProxyServer(parentCtx context.Context, addr, serverURL string, privat
 		addr:        addr,
 		serverURL:   serverURL,
 		privateKey:  privateKey,
-		packetChan:  make(chan Packet, 1000),
+		packetChan:  make(chan Packet, 50000), // Increased from 1000 to handle high throughput
 		ReachableAt: reachableAt,
 		ctx:         ctx,
 		cancel:      cancel,
@@ -192,8 +193,13 @@ func (s *UDPProxyServer) Start() error {
 	s.conn = conn
 	logger.Info("UDP server listening on %s", s.addr)
 
-	// Start a fixed number of worker goroutines.
-	workerCount := 10 // TODO: Make this configurable or pick it better!
+	// Start worker goroutines based on CPU cores for better parallelism
+	// At high throughput (160+ Mbps), we need many workers to avoid bottlenecks
+	workerCount := runtime.NumCPU() * 10
+	if workerCount < 20 {
+		workerCount = 20 // Minimum 20 workers
+	}
+	logger.Info("Starting %d packet workers (CPUs: %d)", workerCount, runtime.NumCPU())
 	for i := 0; i < workerCount; i++ {
 		go s.packetWorker()
 	}
