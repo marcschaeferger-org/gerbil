@@ -309,7 +309,7 @@ func (s *UDPProxyServer) packetWorker() {
 			allowed := rlEntry.count <= 2
 			rlEntry.mu.Unlock()
 			if !allowed {
-				logger.Debug("Rate limiting hole punch message from %s", rateLimitKey)
+				// logger.Debug("Rate limiting hole punch message from %s", rateLimitKey)
 				bufferPool.Put(packet.data[:1500])
 				continue
 			}
@@ -333,7 +333,7 @@ func (s *UDPProxyServer) packetWorker() {
 			// This appears to be an encrypted message
 			decryptedData, err := s.decryptMessage(encMsg)
 			if err != nil {
-				logger.Error("Failed to decrypt message: %v", err)
+				// logger.Error("Failed to decrypt message: %v", err)
 				// Return the buffer to the pool for reuse and continue with next packet
 				bufferPool.Put(packet.data[:1500])
 				continue
