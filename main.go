@@ -43,6 +43,7 @@ var (
 	proxyRelay       *relay.UDPProxyServer
 	proxySNI         *proxy.SNIProxy
 	doTrafficShaping bool
+	bandwidthLimit   string
 )
 
 type WgConfig struct {
@@ -153,6 +154,7 @@ func main() {
 	trustedUpstreamsStr = os.Getenv("TRUSTED_UPSTREAMS")
 	proxyProtocolStr := os.Getenv("PROXY_PROTOCOL")
 	doTrafficShapingStr := os.Getenv("DO_TRAFFIC_SHAPING")
+	bandwidthLimitStr := os.Getenv("BANDWIDTH_LIMIT")
 
 	if interfaceName == "" {
 		flag.StringVar(&interfaceName, "interface", "wg0", "Name of the WireGuard interface")
@@ -229,6 +231,13 @@ func main() {
 	}
 	if doTrafficShapingStr == "" {
 		flag.BoolVar(&doTrafficShaping, "do-traffic-shaping", false, "Whether to set up traffic shaping rules for peers (requires tc command and root privileges)")
+	}
+
+	if bandwidthLimitStr != "" {
+		bandwidthLimit = bandwidthLimitStr
+	}
+	if bandwidthLimitStr == "" {
+		flag.StringVar(&bandwidthLimit, "bandwidth-limit", "50mbit", "Bandwidth limit per peer for traffic shaping (e.g. 50mbit, 1gbit)")
 	}
 
 	flag.Parse()
@@ -1351,10 +1360,10 @@ func monitorMemory(limit uint64) {
 }
 
 // setupPeerBandwidthLimit sets up TC (Traffic Control) to limit bandwidth for a specific peer IP
-// Currently hardcoded to 20 Mbps per peer
+// Bandwidth limit is configurable via the --bandwidth-limit flag or BANDWIDTH_LIMIT env var (default: 50mbit)
 func setupPeerBandwidthLimit(peerIP string) error {
 	logger.Debug("setupPeerBandwidthLimit called for peer IP: %s", peerIP)
-	const bandwidthLimit = "50mbit" // 50 Mbps limit per peer
+
 
 	// Parse the IP to get just the IP address (strip any CIDR notation if present)
 	ip := peerIP
