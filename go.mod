@@ -1,6 +1,6 @@
 module github.com/fosrl/gerbil
 
-go 1.25
+go 1.25.0
 
 require (
 	github.com/patrickmn/go-cache v2.1.0+incompatible
@@ -15,7 +15,6 @@ require (
 	golang.org/x/crypto v0.48.0
 	golang.org/x/sync v0.19.0
 	golang.zx2c4.com/wireguard/wgctrl v0.0.0-20230429144221-925a1e7659e6
-	google.golang.org/grpc v1.79.3
 )
 
 require (
@@ -46,5 +45,6 @@ require (
 	golang.zx2c4.com/wireguard v0.0.0-20230325221338-052af4a8072b // indirect
 	google.golang.org/genproto/googleapis/api v0.0.0-20260209200024-4cfbd4190f57 // indirect
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260209200024-4cfbd4190f57 // indirect
+	google.golang.org/grpc v1.79.3 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
 )
