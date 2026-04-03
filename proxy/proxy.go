@@ -70,6 +70,12 @@ type SNIProxy struct {
 
 	// Trusted upstream proxies that can send PROXY protocol
 	trustedUpstreams map[string]struct{}
+
+	// Reusable HTTP client for API requests
+	httpClient *http.Client
+
+	// Buffer pool for connection piping
+	bufferPool *sync.Pool
 }
 
 type activeTunnel struct {
@@ -375,6 +381,20 @@ func NewSNIProxy(port int, remoteConfigURL, publicKey, localProxyAddr string, lo
 		localOverrides:   overridesMap,
 		activeTunnels:    make(map[string]*activeTunnel),
 		trustedUpstreams: trustedMap,
+		httpClient: &http.Client{
+			Timeout: 5 * time.Second,
+			Transport: &http.Transport{
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 10,
+				IdleConnTimeout:     90 * time.Second,
+			},
+		},
+		bufferPool: &sync.Pool{
+			New: func() interface{} {
+				buf := make([]byte, 32*1024)
+				return &buf
+			},
+		},
 	}
 
 	return proxy, nil
@@ -697,8 +717,8 @@ func (p *SNIProxy) getRoute(hostname, clientAddr string) (*RouteRecord, error) {
 
 	// Make HTTP request
 	apiStart := time.Now()
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	// Make HTTP request using reusable client
+	resp, err := p.httpClient.Do(req)
 	if err != nil {
 		metrics.RecordSNIRouteAPIRequest("error")
 		return nil, fmt.Errorf("API request failed: %w", err)
@@ -793,9 +813,15 @@ func (p *SNIProxy) pipe(hostname string, clientConn, targetConn net.Conn, client
 		defer wg.Done()
 		defer closeConns()
 
-		// Use a large buffer for better performance
-		buf := make([]byte, 32*1024)
-		bytesCopied, err := io.CopyBuffer(targetConn, clientReader, buf)
+		// Get buffer from pool and return when done
+		bufPtr := p.bufferPool.Get().(*[]byte)
+		defer func() {
+			// Clear buffer before returning to pool to prevent data leakage
+			clear(*bufPtr)
+			p.bufferPool.Put(bufPtr)
+		}()
+
+		bytesCopied, err := io.CopyBuffer(targetConn, clientReader, *bufPtr)
 		metrics.RecordProxyBytesTransmitted(hostname, "client_to_target", bytesCopied)
 		if err != nil && err != io.EOF {
 			logger.Debug("Copy client->target error: %v", err)
@@ -807,9 +833,15 @@ func (p *SNIProxy) pipe(hostname string, clientConn, targetConn net.Conn, client
 		defer wg.Done()
 		defer closeConns()
 
-		// Use a large buffer for better performance
-		buf := make([]byte, 32*1024)
-		bytesCopied, err := io.CopyBuffer(clientConn, targetConn, buf)
+		// Get buffer from pool and return when done
+		bufPtr := p.bufferPool.Get().(*[]byte)
+		defer func() {
+			// Clear buffer before returning to pool to prevent data leakage
+			clear(*bufPtr)
+			p.bufferPool.Put(bufPtr)
+		}()
+
+		bytesCopied, err := io.CopyBuffer(clientConn, targetConn, *bufPtr)
 		metrics.RecordProxyBytesTransmitted(hostname, "target_to_client", bytesCopied)
 		if err != nil && err != io.EOF {
 			logger.Debug("Copy target->client error: %v", err)
