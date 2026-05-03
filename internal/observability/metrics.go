@@ -43,20 +43,20 @@ type Histogram interface {
 type Backend interface {
 	// NewCounter creates a counter metric.
 	// labelNames declares the set of label keys that will be passed at observation time.
-	NewCounter(name, desc string, labelNames ...string) Counter
+	NewCounter(name, desc string, labelNames ...string) (Counter, error)
 
 	// NewUpDownCounter creates an up-down counter metric.
-	NewUpDownCounter(name, desc string, labelNames ...string) UpDownCounter
+	NewUpDownCounter(name, desc string, labelNames ...string) (UpDownCounter, error)
 
 	// NewInt64Gauge creates an integer gauge metric.
-	NewInt64Gauge(name, desc string, labelNames ...string) Int64Gauge
+	NewInt64Gauge(name, desc string, labelNames ...string) (Int64Gauge, error)
 
 	// NewFloat64Gauge creates a float gauge metric.
-	NewFloat64Gauge(name, desc string, labelNames ...string) Float64Gauge
+	NewFloat64Gauge(name, desc string, labelNames ...string) (Float64Gauge, error)
 
 	// NewHistogram creates a histogram metric.
 	// buckets are the explicit upper-bound bucket boundaries.
-	NewHistogram(name, desc string, buckets []float64, labelNames ...string) Histogram
+	NewHistogram(name, desc string, buckets []float64, labelNames ...string) (Histogram, error)
 
 	// HTTPHandler returns the /metrics HTTP handler.
 	// Implementations that do not expose an HTTP endpoint return nil.
@@ -88,6 +88,7 @@ func New(cfg MetricsConfig) (Backend, error) {
 			Endpoint:              cfg.OTel.Endpoint,
 			Insecure:              cfg.OTel.Insecure,
 			ExportInterval:        cfg.OTel.ExportInterval,
+			Timeout:               cfg.OTel.Timeout,
 			ServiceName:           cfg.ServiceName,
 			ServiceVersion:        cfg.ServiceVersion,
 			DeploymentEnvironment: cfg.DeploymentEnvironment,
@@ -110,19 +111,19 @@ type promAdapter struct {
 	b *obsprom.Backend
 }
 
-func (a *promAdapter) NewCounter(name, desc string, labelNames ...string) Counter {
+func (a *promAdapter) NewCounter(name, desc string, labelNames ...string) (Counter, error) {
 	return a.b.NewCounter(name, desc, labelNames...)
 }
-func (a *promAdapter) NewUpDownCounter(name, desc string, labelNames ...string) UpDownCounter {
+func (a *promAdapter) NewUpDownCounter(name, desc string, labelNames ...string) (UpDownCounter, error) {
 	return a.b.NewUpDownCounter(name, desc, labelNames...)
 }
-func (a *promAdapter) NewInt64Gauge(name, desc string, labelNames ...string) Int64Gauge {
+func (a *promAdapter) NewInt64Gauge(name, desc string, labelNames ...string) (Int64Gauge, error) {
 	return a.b.NewInt64Gauge(name, desc, labelNames...)
 }
-func (a *promAdapter) NewFloat64Gauge(name, desc string, labelNames ...string) Float64Gauge {
+func (a *promAdapter) NewFloat64Gauge(name, desc string, labelNames ...string) (Float64Gauge, error) {
 	return a.b.NewFloat64Gauge(name, desc, labelNames...)
 }
-func (a *promAdapter) NewHistogram(name, desc string, buckets []float64, labelNames ...string) Histogram {
+func (a *promAdapter) NewHistogram(name, desc string, buckets []float64, labelNames ...string) (Histogram, error) {
 	return a.b.NewHistogram(name, desc, buckets, labelNames...)
 }
 func (a *promAdapter) HTTPHandler() http.Handler          { return a.b.HTTPHandler() }
@@ -133,19 +134,19 @@ type otelAdapter struct {
 	b *obsotel.Backend
 }
 
-func (a *otelAdapter) NewCounter(name, desc string, labelNames ...string) Counter {
+func (a *otelAdapter) NewCounter(name, desc string, labelNames ...string) (Counter, error) {
 	return a.b.NewCounter(name, desc, labelNames...)
 }
-func (a *otelAdapter) NewUpDownCounter(name, desc string, labelNames ...string) UpDownCounter {
+func (a *otelAdapter) NewUpDownCounter(name, desc string, labelNames ...string) (UpDownCounter, error) {
 	return a.b.NewUpDownCounter(name, desc, labelNames...)
 }
-func (a *otelAdapter) NewInt64Gauge(name, desc string, labelNames ...string) Int64Gauge {
+func (a *otelAdapter) NewInt64Gauge(name, desc string, labelNames ...string) (Int64Gauge, error) {
 	return a.b.NewInt64Gauge(name, desc, labelNames...)
 }
-func (a *otelAdapter) NewFloat64Gauge(name, desc string, labelNames ...string) Float64Gauge {
+func (a *otelAdapter) NewFloat64Gauge(name, desc string, labelNames ...string) (Float64Gauge, error) {
 	return a.b.NewFloat64Gauge(name, desc, labelNames...)
 }
-func (a *otelAdapter) NewHistogram(name, desc string, buckets []float64, labelNames ...string) Histogram {
+func (a *otelAdapter) NewHistogram(name, desc string, buckets []float64, labelNames ...string) (Histogram, error) {
 	return a.b.NewHistogram(name, desc, buckets, labelNames...)
 }
 func (a *otelAdapter) HTTPHandler() http.Handler          { return a.b.HTTPHandler() }

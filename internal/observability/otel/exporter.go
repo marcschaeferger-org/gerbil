@@ -3,6 +3,8 @@ package otel
 import (
 	"context"
 	"fmt"
+	"net/url"
+	"strings"
 
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
@@ -11,6 +13,10 @@ import (
 
 // newExporter creates the appropriate OTLP exporter based on cfg.Protocol.
 func newExporter(ctx context.Context, cfg Config) (sdkmetric.Exporter, error) {
+	if strings.TrimSpace(cfg.Endpoint) == "" {
+		return nil, fmt.Errorf("otel: cfg.Endpoint is empty")
+	}
+
 	switch cfg.Protocol {
 	case "grpc", "":
 		return newGRPCExporter(ctx, cfg)
@@ -36,8 +42,20 @@ func newGRPCExporter(ctx context.Context, cfg Config) (sdkmetric.Exporter, error
 }
 
 func newHTTPExporter(ctx context.Context, cfg Config) (sdkmetric.Exporter, error) {
-	opts := []otlpmetrichttp.Option{
-		otlpmetrichttp.WithEndpoint(cfg.Endpoint),
+	endpoint := strings.TrimSpace(cfg.Endpoint)
+
+	opts := make([]otlpmetrichttp.Option, 0, 3)
+	if strings.Contains(endpoint, "://") {
+		parsed, err := url.Parse(endpoint)
+		if err != nil {
+			return nil, fmt.Errorf("otlp http exporter: parse endpoint URL %q: %w", endpoint, err)
+		}
+		opts = append(opts, otlpmetrichttp.WithEndpointURL(parsed.String()))
+	} else {
+		opts = append(opts,
+			otlpmetrichttp.WithEndpoint(endpoint),
+			otlpmetrichttp.WithURLPath("/v1/metrics"),
+		)
 	}
 	if cfg.Insecure {
 		opts = append(opts, otlpmetrichttp.WithInsecure())

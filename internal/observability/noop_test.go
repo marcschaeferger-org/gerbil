@@ -13,32 +13,32 @@ func TestNoopBackendAllInstruments(t *testing.T) {
 	ctx := context.Background()
 	labels := observability.Labels{"k": "v"}
 
-	t.Run("Counter", func(_ *testing.T) {
-		c := n.NewCounter("test_counter", "desc")
+	t.Run("Counter", func(t *testing.T) {
+		c, _ := n.NewCounter("test_counter", "desc")
 		c.Add(ctx, 1, labels)
 		c.Add(ctx, 0, nil)
 	})
 
-	t.Run("UpDownCounter", func(_ *testing.T) {
-		u := n.NewUpDownCounter("test_updown", "desc")
+	t.Run("UpDownCounter", func(t *testing.T) {
+		u, _ := n.NewUpDownCounter("test_updown", "desc")
 		u.Add(ctx, 1, labels)
 		u.Add(ctx, -1, nil)
 	})
 
-	t.Run("Int64Gauge", func(_ *testing.T) {
-		g := n.NewInt64Gauge("test_int64gauge", "desc")
+	t.Run("Int64Gauge", func(t *testing.T) {
+		g, _ := n.NewInt64Gauge("test_int64gauge", "desc")
 		g.Record(ctx, 42, labels)
 		g.Record(ctx, 0, nil)
 	})
 
-	t.Run("Float64Gauge", func(_ *testing.T) {
-		g := n.NewFloat64Gauge("test_float64gauge", "desc")
+	t.Run("Float64Gauge", func(t *testing.T) {
+		g, _ := n.NewFloat64Gauge("test_float64gauge", "desc")
 		g.Record(ctx, 3.14, labels)
 		g.Record(ctx, 0, nil)
 	})
 
-	t.Run("Histogram", func(_ *testing.T) {
-		h := n.NewHistogram("test_histogram", "desc", []float64{1, 5, 10})
+	t.Run("Histogram", func(t *testing.T) {
+		h, _ := n.NewHistogram("test_histogram", "desc", []float64{1, 5, 10})
 		h.Record(ctx, 2.5, labels)
 		h.Record(ctx, 0, nil)
 	})
@@ -56,12 +56,47 @@ func TestNoopBackendAllInstruments(t *testing.T) {
 	})
 }
 
-func TestNoopBackendLabelNames(_ *testing.T) {
+func TestNoopBackendLabelNames(t *testing.T) {
 	// Verify that label names passed at creation time are accepted without panic.
 	n := &observability.NoopBackend{}
-	n.NewCounter("c", "d", "label1", "label2")
-	n.NewUpDownCounter("u", "d", "l1")
-	n.NewInt64Gauge("g1", "d", "l1", "l2", "l3")
-	n.NewFloat64Gauge("g2", "d")
-	n.NewHistogram("h", "d", []float64{0.1, 1.0}, "l1")
+
+	assertNoPanic := func(t *testing.T, constructor string, fn func()) {
+		t.Helper()
+		defer func() {
+			if r := recover(); r != nil {
+				t.Fatalf("%s panicked: %v", constructor, r)
+			}
+		}()
+		fn()
+	}
+
+	t.Run("NewCounter", func(t *testing.T) {
+		assertNoPanic(t, "NewCounter", func() {
+			_, _ = n.NewCounter("c", "d", "label1", "label2")
+		})
+	})
+
+	t.Run("NewUpDownCounter", func(t *testing.T) {
+		assertNoPanic(t, "NewUpDownCounter", func() {
+			_, _ = n.NewUpDownCounter("u", "d", "l1")
+		})
+	})
+
+	t.Run("NewInt64Gauge", func(t *testing.T) {
+		assertNoPanic(t, "NewInt64Gauge", func() {
+			_, _ = n.NewInt64Gauge("g1", "d", "l1", "l2", "l3")
+		})
+	})
+
+	t.Run("NewFloat64Gauge", func(t *testing.T) {
+		assertNoPanic(t, "NewFloat64Gauge", func() {
+			_, _ = n.NewFloat64Gauge("g2", "d")
+		})
+	})
+
+	t.Run("NewHistogram", func(t *testing.T) {
+		assertNoPanic(t, "NewHistogram", func() {
+			_, _ = n.NewHistogram("h", "d", []float64{0.1, 1.0}, "l1")
+		})
+	})
 }
