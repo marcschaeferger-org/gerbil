@@ -83,6 +83,7 @@ type OTelConfig struct {
     Endpoint       string        // default: "localhost:4317"
     Insecure       bool          // default: true
     ExportInterval time.Duration // default: 60s
+    Timeout        time.Duration // default: 10s
 }
 ```
 
@@ -97,6 +98,7 @@ type OTelConfig struct {
 | `OTEL_METRICS_ENDPOINT` | `localhost:4317` | OTLP collector address |
 | `OTEL_METRICS_INSECURE` | `true` | Disable TLS for OTLP |
 | `OTEL_METRICS_EXPORT_INTERVAL` | `60s` | Push interval (e.g. `10s`, `1m`) |
+| `OTEL_METRICS_TIMEOUT` | `10s` | Timeout for OTLP exporter connection setup |
 | `DEPLOYMENT_ENVIRONMENT` | _(unset)_ | OTel deployment.environment attribute |
 
 ### CLI flags
@@ -108,7 +110,8 @@ type OTelConfig struct {
 --otel-metrics-protocol      string  (default: grpc)
 --otel-metrics-endpoint      string  (default: localhost:4317)
 --otel-metrics-insecure      bool    (default: true)
---otel-metrics-export-interval  duration  (default: 1m0s)
+--otel-metrics-export-interval  duration  (default: 60s)
+--otel-metrics-timeout          duration  (default: 10s)
 ```
 
 ---
@@ -164,6 +167,7 @@ export OTEL_METRICS_PROTOCOL=grpc
 export OTEL_METRICS_ENDPOINT=otel-collector:4317
 export OTEL_METRICS_INSECURE=true
 export OTEL_METRICS_EXPORT_INTERVAL=10s
+export OTEL_METRICS_TIMEOUT=10s
 export DEPLOYMENT_ENVIRONMENT=production
 ```
 
@@ -176,6 +180,7 @@ export DEPLOYMENT_ENVIRONMENT=production
          --otel-metrics-endpoint=otel-collector:4317 \
          --otel-metrics-insecure \
          --otel-metrics-export-interval=10s \
+         --otel-metrics-timeout=10s \
          --config=/etc/gerbil/config.json
 ```
 
@@ -225,7 +230,6 @@ All metrics use the prefix `gerbil_<component>_<name>`.
 | Metric | Type | Labels |
 |--------|------|--------|
 | `gerbil_proxy_mapping_active` | UpDownCounter | `ifname` |
-| `gerbil_session_active` | UpDownCounter | `ifname` |
 | `gerbil_active_sessions` | UpDownCounter | `ifname` |
 | `gerbil_udp_packets_total` | Counter | `ifname`, `type`, `direction` |
 | `gerbil_hole_punch_events_total` | Counter | `ifname`, `result` |
@@ -256,7 +260,7 @@ The `docker-compose.metrics.yml` provides a complete observability stack.
 **Prometheus mode:**
 
 ```bash
-METRICS_BACKEND=prometheus docker-compose -f docker-compose.metrics.yml up -d
+METRICS_BACKEND=prometheus docker-compose -f docker compose.metrics.yml up -d
 # Scrape at http://localhost:3003/metrics
 # Grafana at http://localhost:3000 (admin/admin)
 ```
@@ -265,5 +269,5 @@ METRICS_BACKEND=prometheus docker-compose -f docker-compose.metrics.yml up -d
 
 ```bash
 METRICS_BACKEND=otel OTEL_METRICS_ENDPOINT=otel-collector:4317 \
-  docker-compose -f docker-compose.metrics.yml up -d
+  docker compose -f docker-compose.metrics.yml up -d
 ```
