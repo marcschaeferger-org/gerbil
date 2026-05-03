@@ -7,6 +7,7 @@ package prometheus
 
 import (
 	"context"
+	"log"
 	"net/http"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -30,9 +31,10 @@ type Config struct {
 // in the backend-specific instrument types that implement the observability
 // instrument interfaces.
 type Backend struct {
-	cfg      Config
-	registry *prometheus.Registry
-	handler  http.Handler
+	cfg                   Config
+	registry              *prometheus.Registry
+	handler               http.Handler
+	droppedSamplesCounter prometheus.Counter
 }
 
 // New creates and initialises a Prometheus backend.
@@ -48,6 +50,11 @@ func New(cfg Config) (*Backend, error) {
 	}
 
 	registry := prometheus.NewRegistry()
+	droppedSamplesCounter := prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "gerbil_dropped_metric_samples_total",
+		Help: "Total number of metric samples dropped due to invalid labels or unsupported label sets",
+	})
+	registry.MustRegister(droppedSamplesCounter)
 
 	// Include Go and process metrics by default.
 	includeGo := cfg.IncludeGoMetrics == nil || *cfg.IncludeGoMetrics
@@ -62,7 +69,7 @@ func New(cfg Config) (*Backend, error) {
 		EnableOpenMetrics: false,
 	})
 
-	return &Backend{cfg: cfg, registry: registry, handler: handler}, nil
+	return &Backend{cfg: cfg, registry: registry, handler: handler, droppedSamplesCounter: droppedSamplesCounter}, nil
 }
 
 // HTTPHandler returns the Prometheus /metrics HTTP handler.
@@ -78,60 +85,107 @@ func (b *Backend) Shutdown(_ context.Context) error {
 }
 
 // NewCounter creates a Prometheus CounterVec registered on the backend's registry.
-func (b *Backend) NewCounter(name, desc string, labelNames ...string) *Counter {
+func (b *Backend) NewCounter(name, desc string, labelNames ...string) (*Counter, error) {
 	vec := prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: name,
 		Help: desc,
 	}, labelNames)
-	b.registry.MustRegister(vec)
-	return &Counter{vec: vec}
+	if err := b.registry.Register(vec); err != nil {
+		if are, ok := err.(prometheus.AlreadyRegisteredError); ok {
+			existing, ok := are.ExistingCollector.(*prometheus.CounterVec)
+			if !ok {
+				return nil, err
+			}
+			return &Counter{vec: existing, labelNames: append([]string(nil), labelNames...), droppedSamplesCounter: b.droppedSamplesCounter}, nil
+		}
+		return nil, err
+	}
+	return &Counter{vec: vec, labelNames: append([]string(nil), labelNames...), droppedSamplesCounter: b.droppedSamplesCounter}, nil
 }
 
 // NewUpDownCounter creates a Prometheus GaugeVec (Prometheus gauges are
 // bidirectional) registered on the backend's registry.
-func (b *Backend) NewUpDownCounter(name, desc string, labelNames ...string) *UpDownCounter {
+func (b *Backend) NewUpDownCounter(name, desc string, labelNames ...string) (*UpDownCounter, error) {
 	vec := prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: name,
 		Help: desc,
 	}, labelNames)
-	b.registry.MustRegister(vec)
-	return &UpDownCounter{vec: vec}
+	if err := b.registry.Register(vec); err != nil {
+		if are, ok := err.(prometheus.AlreadyRegisteredError); ok {
+			existing, ok := are.ExistingCollector.(*prometheus.GaugeVec)
+			if !ok {
+				return nil, err
+			}
+			return &UpDownCounter{vec: existing, labelNames: append([]string(nil), labelNames...), droppedSamplesCounter: b.droppedSamplesCounter}, nil
+		}
+		return nil, err
+	}
+	return &UpDownCounter{vec: vec, labelNames: append([]string(nil), labelNames...), droppedSamplesCounter: b.droppedSamplesCounter}, nil
 }
 
 // NewInt64Gauge creates a Prometheus GaugeVec registered on the backend's registry.
-func (b *Backend) NewInt64Gauge(name, desc string, labelNames ...string) *Int64Gauge {
+func (b *Backend) NewInt64Gauge(name, desc string, labelNames ...string) (*Int64Gauge, error) {
 	vec := prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: name,
 		Help: desc,
 	}, labelNames)
-	b.registry.MustRegister(vec)
-	return &Int64Gauge{vec: vec}
+	if err := b.registry.Register(vec); err != nil {
+		if are, ok := err.(prometheus.AlreadyRegisteredError); ok {
+			existing, ok := are.ExistingCollector.(*prometheus.GaugeVec)
+			if !ok {
+				return nil, err
+			}
+			return &Int64Gauge{vec: existing, labelNames: append([]string(nil), labelNames...), droppedSamplesCounter: b.droppedSamplesCounter}, nil
+		}
+		return nil, err
+	}
+	return &Int64Gauge{vec: vec, labelNames: append([]string(nil), labelNames...), droppedSamplesCounter: b.droppedSamplesCounter}, nil
 }
 
 // NewFloat64Gauge creates a Prometheus GaugeVec registered on the backend's registry.
-func (b *Backend) NewFloat64Gauge(name, desc string, labelNames ...string) *Float64Gauge {
+func (b *Backend) NewFloat64Gauge(name, desc string, labelNames ...string) (*Float64Gauge, error) {
 	vec := prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: name,
 		Help: desc,
 	}, labelNames)
-	b.registry.MustRegister(vec)
-	return &Float64Gauge{vec: vec}
+	if err := b.registry.Register(vec); err != nil {
+		if are, ok := err.(prometheus.AlreadyRegisteredError); ok {
+			existing, ok := are.ExistingCollector.(*prometheus.GaugeVec)
+			if !ok {
+				return nil, err
+			}
+			return &Float64Gauge{vec: existing, labelNames: append([]string(nil), labelNames...), droppedSamplesCounter: b.droppedSamplesCounter}, nil
+		}
+		return nil, err
+	}
+	return &Float64Gauge{vec: vec, labelNames: append([]string(nil), labelNames...), droppedSamplesCounter: b.droppedSamplesCounter}, nil
 }
 
 // NewHistogram creates a Prometheus HistogramVec registered on the backend's registry.
-func (b *Backend) NewHistogram(name, desc string, buckets []float64, labelNames ...string) *Histogram {
+func (b *Backend) NewHistogram(name, desc string, buckets []float64, labelNames ...string) (*Histogram, error) {
 	vec := prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    name,
 		Help:    desc,
 		Buckets: buckets,
 	}, labelNames)
-	b.registry.MustRegister(vec)
-	return &Histogram{vec: vec}
+	if err := b.registry.Register(vec); err != nil {
+		if are, ok := err.(prometheus.AlreadyRegisteredError); ok {
+			existing, ok := are.ExistingCollector.(*prometheus.HistogramVec)
+			if !ok {
+				return nil, err
+			}
+			return &Histogram{vec: existing, labelNames: append([]string(nil), labelNames...), droppedSamplesCounter: b.droppedSamplesCounter}, nil
+		}
+		return nil, err
+	}
+	return &Histogram{vec: vec, labelNames: append([]string(nil), labelNames...), droppedSamplesCounter: b.droppedSamplesCounter}, nil
 }
 
 // Counter is a native Prometheus counter instrument.
 type Counter struct {
-	vec *prometheus.CounterVec
+	vec                   *prometheus.CounterVec
+	labelNames            []string
+	droppedSamplesCounter prometheus.Counter
 }
 
 // Add increments the counter by value for the given labels.
@@ -139,47 +193,118 @@ type Counter struct {
 // value must be non-negative. Negative values are ignored.
 func (c *Counter) Add(_ context.Context, value int64, labels map[string]string) {
 	if value < 0 {
+		log.Printf("WARN: counter add called with negative value=%d labels=%v expected_labels=%v", value, labels, c.labelNames)
 		return
 	}
-	c.vec.With(prometheus.Labels(labels)).Add(float64(value))
+	normalized, ok := normalizeLabels(c.labelNames, labels, c.droppedSamplesCounter)
+	if !ok {
+		return
+	}
+	defer guardMetricPanic("counter", c.labelNames, labels)
+	c.vec.With(normalized).Add(float64(value))
 }
 
 // UpDownCounter is a native Prometheus gauge used as a bidirectional counter.
 type UpDownCounter struct {
-	vec *prometheus.GaugeVec
+	vec                   *prometheus.GaugeVec
+	labelNames            []string
+	droppedSamplesCounter prometheus.Counter
 }
 
 // Add adjusts the gauge by value for the given labels.
 func (u *UpDownCounter) Add(_ context.Context, value int64, labels map[string]string) {
-	u.vec.With(prometheus.Labels(labels)).Add(float64(value))
+	normalized, ok := normalizeLabels(u.labelNames, labels, u.droppedSamplesCounter)
+	if !ok {
+		return
+	}
+	defer guardMetricPanic("updown", u.labelNames, labels)
+	u.vec.With(normalized).Add(float64(value))
 }
 
 // Int64Gauge is a native Prometheus gauge recording integer snapshot values.
 type Int64Gauge struct {
-	vec *prometheus.GaugeVec
+	vec                   *prometheus.GaugeVec
+	labelNames            []string
+	droppedSamplesCounter prometheus.Counter
 }
 
 // Record sets the gauge to value for the given labels.
 func (g *Int64Gauge) Record(_ context.Context, value int64, labels map[string]string) {
-	g.vec.With(prometheus.Labels(labels)).Set(float64(value))
+	normalized, ok := normalizeLabels(g.labelNames, labels, g.droppedSamplesCounter)
+	if !ok {
+		return
+	}
+	defer guardMetricPanic("int64-gauge", g.labelNames, labels)
+	g.vec.With(normalized).Set(float64(value))
 }
 
 // Float64Gauge is a native Prometheus gauge recording float snapshot values.
 type Float64Gauge struct {
-	vec *prometheus.GaugeVec
+	vec                   *prometheus.GaugeVec
+	labelNames            []string
+	droppedSamplesCounter prometheus.Counter
 }
 
 // Record sets the gauge to value for the given labels.
 func (g *Float64Gauge) Record(_ context.Context, value float64, labels map[string]string) {
-	g.vec.With(prometheus.Labels(labels)).Set(value)
+	normalized, ok := normalizeLabels(g.labelNames, labels, g.droppedSamplesCounter)
+	if !ok {
+		return
+	}
+	defer guardMetricPanic("float64-gauge", g.labelNames, labels)
+	g.vec.With(normalized).Set(value)
 }
 
 // Histogram is a native Prometheus histogram instrument.
 type Histogram struct {
-	vec *prometheus.HistogramVec
+	vec                   *prometheus.HistogramVec
+	labelNames            []string
+	droppedSamplesCounter prometheus.Counter
 }
 
 // Record observes value for the given labels.
 func (h *Histogram) Record(_ context.Context, value float64, labels map[string]string) {
-	h.vec.With(prometheus.Labels(labels)).Observe(value)
+	normalized, ok := normalizeLabels(h.labelNames, labels, h.droppedSamplesCounter)
+	if !ok {
+		return
+	}
+	defer guardMetricPanic("histogram", h.labelNames, labels)
+	h.vec.With(normalized).Observe(value)
+}
+
+func normalizeLabels(labelNames []string, labels map[string]string, droppedSamplesCounter prometheus.Counter) (prometheus.Labels, bool) {
+	if len(labelNames) == 0 {
+		if len(labels) > 0 {
+			if droppedSamplesCounter != nil {
+				droppedSamplesCounter.Inc()
+			}
+			log.Printf("WARN: dropping metric sample due to unexpected labels: got=%v expected=none", labels)
+			return nil, false
+		}
+		return nil, true
+	}
+
+	normalized := make(prometheus.Labels, len(labelNames))
+	for _, name := range labelNames {
+		normalized[name] = ""
+	}
+
+	for k, v := range labels {
+		if _, ok := normalized[k]; !ok {
+			if droppedSamplesCounter != nil {
+				droppedSamplesCounter.Inc()
+			}
+			log.Printf("WARN: dropping metric sample due to unexpected label key %q (expected=%v)", k, labelNames)
+			return nil, false
+		}
+		normalized[k] = v
+	}
+
+	return normalized, true
+}
+
+func guardMetricPanic(kind string, expected []string, labels map[string]string) {
+	if recovered := recover(); recovered != nil {
+		log.Printf("WARN: dropped %s metric sample due to label panic: expected=%v got=%v err=%v", kind, expected, labels, recovered)
+	}
 }

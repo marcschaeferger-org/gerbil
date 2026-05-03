@@ -548,7 +548,7 @@ func (p *SNIProxy) handleConnection(clientConn net.Conn) {
 		logger.Debug("SNI extraction failed: %v", err)
 		return
 	}
-	metrics.RecordProxyTLSHandshake(hostname, time.Since(clientHelloStart).Seconds())
+	metrics.RecordProxyTLSHandshake(time.Since(clientHelloStart).Seconds())
 
 	if hostname == "" {
 		log.Println("No SNI hostname found")
@@ -596,8 +596,8 @@ func (p *SNIProxy) handleConnection(clientConn net.Conn) {
 	defer targetConn.Close()
 
 	logger.Debug("Connected to target: %s:%d", route.TargetHost, route.TargetPort)
-	metrics.RecordActiveProxyConnection(hostname, 1)
-	defer metrics.RecordActiveProxyConnection(hostname, -1)
+	metrics.RecordActiveProxyConnection(1)
+	defer metrics.RecordActiveProxyConnection(-1)
 
 	// Send PROXY protocol header if enabled
 	if p.proxyProtocol {
@@ -655,7 +655,7 @@ func (p *SNIProxy) getRoute(hostname, clientAddr string) (*RouteRecord, error) {
 	// Check local overrides first
 	if _, isOverride := p.localOverrides[hostname]; isOverride {
 		logger.Debug("Local override matched for hostname: %s", hostname)
-		metrics.RecordProxyRouteLookup("local_override", hostname)
+		metrics.RecordProxyRouteLookup("local_override")
 		return &RouteRecord{
 			Hostname:   hostname,
 			TargetHost: p.localProxyAddr,
@@ -668,7 +668,7 @@ func (p *SNIProxy) getRoute(hostname, clientAddr string) (*RouteRecord, error) {
 	_, isLocal := p.localSNIs[hostname]
 	p.localSNIsLock.RUnlock()
 	if isLocal {
-		metrics.RecordProxyRouteLookup("local", hostname)
+		metrics.RecordProxyRouteLookup("local")
 		return &RouteRecord{
 			Hostname:   hostname,
 			TargetHost: p.localProxyAddr,
@@ -679,16 +679,16 @@ func (p *SNIProxy) getRoute(hostname, clientAddr string) (*RouteRecord, error) {
 	// Check cache first
 	if cached, found := p.cache.Get(hostname); found {
 		if cached == nil {
-			metrics.RecordProxyRouteLookup("cached_not_found", hostname)
+			metrics.RecordProxyRouteLookup("cached_not_found")
 			return nil, nil // Cached negative result
 		}
 		logger.Debug("Cache hit for hostname: %s", hostname)
-		metrics.RecordProxyRouteLookup("cache_hit", hostname)
+		metrics.RecordProxyRouteLookup("cache_hit")
 		return cached.(*RouteRecord), nil
 	}
 
 	logger.Debug("Cache miss for hostname: %s, querying API", hostname)
-	metrics.RecordProxyRouteLookup("cache_miss", hostname)
+	metrics.RecordProxyRouteLookup("cache_miss")
 
 	// Query API with timeout
 	ctx, cancel := context.WithTimeout(p.ctx, 5*time.Second)
@@ -822,7 +822,7 @@ func (p *SNIProxy) pipe(hostname string, clientConn, targetConn net.Conn, client
 		}()
 
 		bytesCopied, err := io.CopyBuffer(targetConn, clientReader, *bufPtr)
-		metrics.RecordProxyBytesTransmitted(hostname, "client_to_target", bytesCopied)
+		metrics.RecordProxyBytesTransmitted("client_to_target", bytesCopied)
 		if err != nil && err != io.EOF {
 			logger.Debug("Copy client->target error: %v", err)
 		}
@@ -842,7 +842,7 @@ func (p *SNIProxy) pipe(hostname string, clientConn, targetConn net.Conn, client
 		}()
 
 		bytesCopied, err := io.CopyBuffer(clientConn, targetConn, *bufPtr)
-		metrics.RecordProxyBytesTransmitted(hostname, "target_to_client", bytesCopied)
+		metrics.RecordProxyBytesTransmitted("target_to_client", bytesCopied)
 		if err != nil && err != io.EOF {
 			logger.Debug("Copy target->client error: %v", err)
 		}

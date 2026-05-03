@@ -89,6 +89,9 @@ func TestDefaultConfig(t *testing.T) {
 }
 
 func TestShutdownNoInit(t *testing.T) {
+	// Ensure a known clean global state before testing no-init shutdown behavior.
+	_ = metrics.Shutdown(context.Background())
+
 	// Shutdown without Initialize should not panic or error.
 	if err := metrics.Shutdown(context.Background()); err != nil {
 		t.Errorf("unexpected error: %v", err)
@@ -168,6 +171,7 @@ func TestRecordRelay(t *testing.T) {
 	body := scrape(t, h)
 	assertContains(t, body, "gerbil_udp_packets_total")
 	assertContains(t, body, "gerbil_proxy_mapping_active")
+	assertContains(t, body, "gerbil_active_sessions")
 }
 
 func TestRecordWireGuard(t *testing.T) {
@@ -216,10 +220,10 @@ func TestRecordNetlink(t *testing.T) {
 	metrics.RecordKernelModuleLoad("success")
 	metrics.RecordFirewallRuleApplied("success", "INPUT")
 	metrics.RecordActiveSession("wg0", 1)
-	metrics.RecordActiveProxyConnection(exampleHostname, 1)
-	metrics.RecordProxyRouteLookup("hit", exampleHostname)
-	metrics.RecordProxyTLSHandshake(exampleHostname, 0.05)
-	metrics.RecordProxyBytesTransmitted(exampleHostname, "tx", 1024)
+	metrics.RecordActiveProxyConnection(1)
+	metrics.RecordProxyRouteLookup("hit")
+	metrics.RecordProxyTLSHandshake(0.05)
+	metrics.RecordProxyBytesTransmitted("tx", 1024)
 	body := scrape(t, h)
 	assertContains(t, body, "gerbil_netlink_events_total")
 	assertContains(t, body, "gerbil_active_sessions")

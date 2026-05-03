@@ -55,7 +55,10 @@ func TestOtelBackendCounter(t *testing.T) {
 	b := newInMemoryBackend(t)
 	defer b.Shutdown(context.Background()) //nolint:errcheck
 
-	c := b.NewCounter("gerbil_test_counter_total", "test counter", "result")
+	c, err := b.NewCounter("gerbil_test_counter_total", "test counter", "result")
+	if err != nil {
+		t.Fatalf("NewCounter returned error: %v", err)
+	}
 	// Should not panic
 	c.Add(context.Background(), 1, map[string]string{"result": "ok"})
 	c.Add(context.Background(), 5, nil)
@@ -65,7 +68,10 @@ func TestOtelBackendUpDownCounter(t *testing.T) {
 	b := newInMemoryBackend(t)
 	defer b.Shutdown(context.Background()) //nolint:errcheck
 
-	u := b.NewUpDownCounter("gerbil_test_updown", "test updown", "state")
+	u, err := b.NewUpDownCounter("gerbil_test_updown", "test updown", "state")
+	if err != nil {
+		t.Fatalf("NewUpDownCounter returned error: %v", err)
+	}
 	u.Add(context.Background(), 3, map[string]string{"state": "active"})
 	u.Add(context.Background(), -1, map[string]string{"state": "active"})
 }
@@ -74,7 +80,10 @@ func TestOtelBackendInt64Gauge(t *testing.T) {
 	b := newInMemoryBackend(t)
 	defer b.Shutdown(context.Background()) //nolint:errcheck
 
-	g := b.NewInt64Gauge("gerbil_test_int_gauge", "test gauge")
+	g, err := b.NewInt64Gauge("gerbil_test_int_gauge", "test gauge")
+	if err != nil {
+		t.Fatalf("NewInt64Gauge returned error: %v", err)
+	}
 	g.Record(context.Background(), 42, nil)
 }
 
@@ -82,7 +91,10 @@ func TestOtelBackendFloat64Gauge(t *testing.T) {
 	b := newInMemoryBackend(t)
 	defer b.Shutdown(context.Background()) //nolint:errcheck
 
-	g := b.NewFloat64Gauge("gerbil_test_float_gauge", "test float gauge")
+	g, err := b.NewFloat64Gauge("gerbil_test_float_gauge", "test float gauge")
+	if err != nil {
+		t.Fatalf("NewFloat64Gauge returned error: %v", err)
+	}
 	g.Record(context.Background(), 3.14, nil)
 }
 
@@ -90,8 +102,11 @@ func TestOtelBackendHistogram(t *testing.T) {
 	b := newInMemoryBackend(t)
 	defer b.Shutdown(context.Background()) //nolint:errcheck
 
-	h := b.NewHistogram("gerbil_test_duration_seconds", "test histogram",
+	h, err := b.NewHistogram("gerbil_test_duration_seconds", "test histogram",
 		[]float64{0.1, 0.5, 1.0}, "method")
+	if err != nil {
+		t.Fatalf("NewHistogram returned error: %v", err)
+	}
 	h.Record(context.Background(), 0.3, map[string]string{"method": "GET"})
 }
 
@@ -138,4 +153,23 @@ func TestOtelBackendDeploymentEnvironment(t *testing.T) {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	defer b.Shutdown(context.Background()) //nolint:errcheck
+}
+
+func TestOtelBackendRejectsInvalidLabelNames(t *testing.T) {
+	b := newInMemoryBackend(t)
+	defer b.Shutdown(context.Background()) //nolint:errcheck
+
+	t.Run("duplicate labels", func(t *testing.T) {
+		_, err := b.NewCounter("gerbil_test_invalid_labels_total", "test counter", "result", "result")
+		if err == nil {
+			t.Fatal("expected error for duplicate label names")
+		}
+	})
+
+	t.Run("invalid label name", func(t *testing.T) {
+		_, err := b.NewHistogram("gerbil_test_invalid_histogram", "test histogram", []float64{0.1, 1.0}, "status-code")
+		if err == nil {
+			t.Fatal("expected error for invalid label name")
+		}
+	})
 }

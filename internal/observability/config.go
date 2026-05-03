@@ -60,6 +60,10 @@ type OTelConfig struct {
 	// ExportInterval is how often metrics are pushed to the collector.
 	// Defaults to 60 s.
 	ExportInterval time.Duration
+
+	// Timeout bounds OTLP exporter construction calls.
+	// Defaults to 10 s.
+	Timeout time.Duration
 }
 
 // DefaultMetricsConfig returns a MetricsConfig with sensible defaults.
@@ -75,6 +79,7 @@ func DefaultMetricsConfig() MetricsConfig {
 			Endpoint:       "localhost:4317",
 			Insecure:       true,
 			ExportInterval: 60 * time.Second,
+			Timeout:        10 * time.Second,
 		},
 		ServiceName:    "gerbil",
 		ServiceVersion: "1.0.0",
@@ -88,8 +93,10 @@ func (c *MetricsConfig) Validate() error {
 	}
 
 	switch c.Backend {
-	case "prometheus", "none", "":
+	case "prometheus", "none":
 		// valid
+	case "":
+		return fmt.Errorf("metrics: enabled requires a non-empty backend")
 	case "otel":
 		if c.OTel.Endpoint == "" {
 			return fmt.Errorf("metrics: backend=otel requires a non-empty OTel endpoint")
@@ -99,6 +106,9 @@ func (c *MetricsConfig) Validate() error {
 		}
 		if c.OTel.ExportInterval <= 0 {
 			return fmt.Errorf("metrics: otel export interval must be positive")
+		}
+		if c.OTel.Timeout <= 0 {
+			return fmt.Errorf("metrics: otel timeout must be positive")
 		}
 	default:
 		return fmt.Errorf("metrics: unknown backend %q (must be \"prometheus\", \"otel\", or \"none\")", c.Backend)

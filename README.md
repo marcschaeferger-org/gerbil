@@ -138,7 +138,7 @@ make
 
 ### Binary
 
-Make sure to have Go 1.23.1 installed.
+Make sure to have Go 1.26 installed.
 
 ```bash
 make local

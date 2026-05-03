@@ -175,6 +175,7 @@ func main() {
 		otelMetricsEndpoint       string
 		otelMetricsInsecure       bool
 		otelMetricsExportInterval time.Duration
+		otelMetricsTimeout        time.Duration
 	)
 
 	interfaceName = os.Getenv("INTERFACE")
@@ -227,6 +228,14 @@ func main() {
 			otelMetricsExportInterval = d
 		} else {
 			log.Printf("WARN: invalid OTEL_METRICS_EXPORT_INTERVAL=%q: %v", v, err2)
+		}
+	}
+	otelMetricsTimeout = 10 * time.Second // default
+	if v := os.Getenv("OTEL_METRICS_TIMEOUT"); v != "" {
+		if d, err2 := time.ParseDuration(v); err2 == nil {
+			otelMetricsTimeout = d
+		} else {
+			log.Printf("WARN: invalid OTEL_METRICS_TIMEOUT=%q: %v", v, err2)
 		}
 	}
 
@@ -322,6 +331,7 @@ func main() {
 	flag.StringVar(&otelMetricsEndpoint, "otel-metrics-endpoint", otelMetricsEndpoint, "OTLP collector endpoint (e.g. localhost:4317)")
 	flag.BoolVar(&otelMetricsInsecure, "otel-metrics-insecure", otelMetricsInsecure, "Disable TLS for OTLP connection")
 	flag.DurationVar(&otelMetricsExportInterval, "otel-metrics-export-interval", otelMetricsExportInterval, "Interval between OTLP metric pushes")
+	flag.DurationVar(&otelMetricsTimeout, "otel-metrics-timeout", otelMetricsTimeout, "Timeout for OTLP exporter setup")
 
 	flag.Parse()
 
@@ -347,6 +357,7 @@ func main() {
 			Endpoint:       otelMetricsEndpoint,
 			Insecure:       otelMetricsInsecure,
 			ExportInterval: otelMetricsExportInterval,
+			Timeout:        otelMetricsTimeout,
 		},
 		ServiceName:           "gerbil",
 		ServiceVersion:        "1.0.0",
@@ -543,6 +554,8 @@ func main() {
 
 	// Register metrics endpoint only for Prometheus backend.
 	// OTel backend pushes to a collector; no /metrics endpoint needed.
+	// Note: metricsPath is registered directly without httpMetricsMiddleware to prevent infinite recursion.
+	// The metricsHandler must not be wrapped by the middleware, as it would observe its own observation calls.
 	if metricsHandler != nil {
 		http.Handle(metricsPath, metricsHandler)
 		logger.Info("Metrics endpoint enabled at %s", metricsPath)
@@ -1162,10 +1175,12 @@ func removePeerInternal(publicKey string) error {
 
 	// Get current peer info before removing to clear relay connections and bandwidth limits
 	var wgIPs []string
+	allowedIPsCount := 0
 	device, err := wgClient.Device(interfaceName)
 	if err == nil {
 		for _, peer := range device.Peers {
 			if peer.PublicKey.String() == publicKey {
+				allowedIPsCount = len(peer.AllowedIPs)
 				// Extract WireGuard IPs from this peer's allowed IPs
 				for _, allowedIP := range peer.AllowedIPs {
 					wgIPs = append(wgIPs, allowedIP.IP.String())
@@ -1208,7 +1223,7 @@ func removePeerInternal(publicKey string) error {
 
 	// Record metrics
 	metrics.RecordPeersTotal(interfaceName, -1)
-	metrics.RecordAllowedIPsCount(interfaceName, publicKey, -int64(len(wgIPs)))
+	metrics.RecordAllowedIPsCount(interfaceName, publicKey, -int64(allowedIPsCount))
 
 	return nil
 }

@@ -13,38 +13,31 @@ type NoopBackend struct{}
 // Compile-time interface check.
 var _ Backend = (*NoopBackend)(nil)
 
-func (n *NoopBackend) NewCounter(_ string, _ string, _ ...string) Counter {
-	_ = n
-	return noopCounter{}
+func (n *NoopBackend) NewCounter(_ string, _ string, _ ...string) (Counter, error) {
+	return noopCounter{}, nil
 }
 
-func (n *NoopBackend) NewUpDownCounter(_ string, _ string, _ ...string) UpDownCounter {
-	_ = n
-	return noopUpDownCounter{}
+func (n *NoopBackend) NewUpDownCounter(_ string, _ string, _ ...string) (UpDownCounter, error) {
+	return noopUpDownCounter{}, nil
 }
 
-func (n *NoopBackend) NewInt64Gauge(_ string, _ string, _ ...string) Int64Gauge {
-	_ = n
-	return noopInt64Gauge{}
+func (n *NoopBackend) NewInt64Gauge(_ string, _ string, _ ...string) (Int64Gauge, error) {
+	return noopInt64Gauge{}, nil
 }
 
-func (n *NoopBackend) NewFloat64Gauge(_ string, _ string, _ ...string) Float64Gauge {
-	_ = n
-	return noopFloat64Gauge{}
+func (n *NoopBackend) NewFloat64Gauge(_ string, _ string, _ ...string) (Float64Gauge, error) {
+	return noopFloat64Gauge{}, nil
 }
 
-func (n *NoopBackend) NewHistogram(_ string, _ string, _ []float64, _ ...string) Histogram {
-	_ = n
-	return noopHistogram{}
+func (n *NoopBackend) NewHistogram(_ string, _ string, _ []float64, _ ...string) (Histogram, error) {
+	return noopHistogram{}, nil
 }
 
 func (n *NoopBackend) HTTPHandler() http.Handler {
-	_ = n
 	return nil
 }
 
 func (n *NoopBackend) Shutdown(_ context.Context) error {
-	_ = n
 	return nil
 }
 
