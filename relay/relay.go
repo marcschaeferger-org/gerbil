@@ -1232,33 +1232,56 @@ func (s *UDPProxyServer) trackCommunicationPattern(fromAddr, toAddr *net.UDPAddr
 
 // tryRebuildSession attempts to rebuild a WireGuard session from communication patterns
 func (s *UDPProxyServer) tryRebuildSession(pattern *CommunicationPattern) {
+	// Require both indices and a minimum amount of bidirectional traffic
+	if pattern.ClientIndex == 0 || pattern.DestIndex == 0 || pattern.PacketCount < 4 {
+		return
+	}
+
 	// Check if we have bidirectional communication within a reasonable time window
 	timeDiff := pattern.LastFromClient.Sub(pattern.LastFromDest)
 	if timeDiff < 0 {
 		timeDiff = -timeDiff
 	}
-
-	// Only rebuild if we have recent bidirectional communication and both indices
-	if timeDiff < 30*time.Second && pattern.ClientIndex != 0 && pattern.DestIndex != 0 && pattern.PacketCount >= 4 {
-		// Create session mapping: client's index maps to destination
-		sessionKey := fmt.Sprintf("%d:%d", pattern.DestIndex, pattern.ClientIndex)
-
-		// Check if we already have this session
-		session := &WireGuardSession{
-			ReceiverIndex: pattern.DestIndex,
-			SenderIndex:   pattern.ClientIndex,
-			DestAddr:      pattern.ToDestination,
-			LastSeen:      time.Now(),
-		}
-		if _, loaded := s.wgSessions.LoadOrStore(sessionKey, session); loaded {
-			s.wgSessions.Store(sessionKey, session)
-		} else {
-			metrics.RecordSession(relayIfname, 1)
-			metrics.RecordSessionRebuilt(relayIfname)
-		}
-		logger.Info("Rebuilt WireGuard session from communication pattern: %s -> %s (packets: %d)",
-			sessionKey, pattern.ToDestination.String(), pattern.PacketCount)
+	if timeDiff >= 30*time.Second {
+		return
 	}
+
+	sessionKey := fmt.Sprintf("%d:%d", pattern.DestIndex, pattern.ClientIndex)
+	destStr := pattern.ToDestination.String()
+
+	// Fast path: if a matching session already exists, just refresh LastSeen and bail out.
+	// This prevents log spam and repeated work for every packet of an established flow.
+	if existing, ok := s.wgSessions.Load(sessionKey); ok {
+		sess := existing.(*WireGuardSession)
+		if da := sess.GetDestAddr(); da != nil && da.String() == destStr {
+			sess.UpdateLastSeen()
+			// Make sure the receiver-index fast-path is populated so future packets
+			// don't keep falling back to broadcast + pattern tracking.
+			if _, indexed := s.sessionsByReceiverIndex.Load(pattern.ClientIndex); !indexed {
+				s.sessionsByReceiverIndex.Store(pattern.ClientIndex, sess)
+			}
+			return
+		}
+	}
+
+	// Create or replace the session mapping
+	session := &WireGuardSession{
+		ReceiverIndex: pattern.DestIndex,
+		SenderIndex:   pattern.ClientIndex,
+		DestAddr:      pattern.ToDestination,
+		LastSeen:      time.Now(),
+	}
+	if _, loaded := s.wgSessions.LoadOrStore(sessionKey, session); loaded {
+		s.wgSessions.Store(sessionKey, session)
+	} else {
+		metrics.RecordSession(relayIfname, 1)
+		metrics.RecordSessionRebuilt(relayIfname)
+	}
+	// Index by client receiver index so the transport-data fast path can find it.
+	s.sessionsByReceiverIndex.Store(pattern.ClientIndex, session)
+
+	logger.Info("Rebuilt WireGuard session from communication pattern: %s -> %s (packets: %d)",
+		sessionKey, destStr, pattern.PacketCount)
 }
 
 // cleanupIdleCommunicationPatterns periodically removes idle communication patterns
