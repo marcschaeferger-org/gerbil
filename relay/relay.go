@@ -1,6 +1,7 @@
 package relay
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/binary"
@@ -137,6 +138,17 @@ const (
 	WireGuardMessageTypeTransportData       = 4
 )
 
+// cachedEndpointState holds the last-known endpoint fields used for change detection.
+// Timestamp is intentionally excluded since it always changes.
+type cachedEndpointState struct {
+	OlmID     string
+	NewtID    string
+	Token     string
+	IP        string
+	Port      int
+	PublicKey string
+}
+
 // --- End Types ---
 
 // bufferPool allows reusing buffers to reduce allocations.
@@ -172,6 +184,12 @@ type UDPProxyServer struct {
 	// Cache for resolved UDP addresses to avoid per-packet DNS lookups
 	// Key: "ip:port" string, Value: *net.UDPAddr
 	addrCache sync.Map
+	// lastEndpointCache stores the last-known endpoint state per client (key: olmId:newtId)
+	// used to skip redundant HTTP notifications when nothing has changed.
+	lastEndpointCache sync.Map
+	// notifyChan is the async queue for hole-punch endpoint notifications.
+	// Dedicated notifier workers drain this channel and perform the HTTP call.
+	notifyChan chan ClientEndpoint
 	// ReachableAt is the URL where this server can be reached
 	ReachableAt string
 }
@@ -184,6 +202,7 @@ func NewUDPProxyServer(parentCtx context.Context, addr, serverURL string, privat
 		serverURL:   serverURL,
 		privateKey:  privateKey,
 		packetChan:  make(chan Packet, 50000), // Increased from 1000 to handle high throughput
+		notifyChan:  make(chan ClientEndpoint, 1000),
 		ReachableAt: reachableAt,
 		ctx:         ctx,
 		cancel:      cancel,
@@ -192,10 +211,15 @@ func NewUDPProxyServer(parentCtx context.Context, addr, serverURL string, privat
 
 // Start sets up the UDP listener, worker pool, and begins reading packets.
 func (s *UDPProxyServer) Start() error {
-	// Fetch initial mappings.
-	if err := s.fetchInitialMappings(); err != nil {
-		return fmt.Errorf("failed to fetch initial mappings: %v", err)
-	}
+	// Fetch initial mappings asynchronously so a large (potentially 100MB+)
+	// response does not block the UDP listener from coming up. Any packets
+	// arriving for unknown mappings before the load completes will simply
+	// log and be repopulated via the hole-punch path.
+	go func() {
+		if err := s.fetchInitialMappings(); err != nil {
+			logger.Error("Failed to fetch initial mappings: %v", err)
+		}
+	}()
 
 	udpAddr, err := net.ResolveUDPAddr("udp", s.addr)
 	if err != nil {
@@ -236,6 +260,11 @@ func (s *UDPProxyServer) Start() error {
 
 	// Start the hole punch rate limiter cleanup routine
 	go s.cleanupHolePunchRateLimiter()
+
+	// Start async endpoint notifier workers (HTTP calls off the hot path)
+	for i := 0; i < 5; i++ {
+		go s.endpointNotifierWorker()
+	}
 
 	return nil
 }
@@ -375,12 +404,58 @@ func (s *UDPProxyServer) packetWorker() {
 				ClientPublicKey:   msg.PublicKey,
 			}
 			logger.Debug("Created endpoint from packet remoteAddr %s: IP=%s, Port=%d", packet.remoteAddr.String(), endpoint.IP, endpoint.Port)
-			s.notifyServer(endpoint)
+
+			// Check if anything meaningful changed before queuing an HTTP notification.
+			cacheKey := endpoint.OlmID + ":" + endpoint.NewtID
+			newState := cachedEndpointState{
+				OlmID:     endpoint.OlmID,
+				NewtID:    endpoint.NewtID,
+				Token:     endpoint.Token,
+				IP:        endpoint.IP,
+				Port:      endpoint.Port,
+				PublicKey: endpoint.ClientPublicKey,
+			}
+			if cached, ok := s.lastEndpointCache.Load(cacheKey); ok && cached.(cachedEndpointState) == newState {
+				// Endpoint unchanged - skip the HTTP call but still clear stale sessions.
+				logger.Debug("Endpoint unchanged for %s, skipping notification", cacheKey)
+				metrics.RecordHolePunchEvent(relayIfname, "deduplicated")
+				s.clearSessionsForIP(endpoint.IP)
+				metrics.RecordHolePunchEvent(relayIfname, "success")
+				bufferPool.Put(packet.data[:1500])
+				continue
+			}
+			s.lastEndpointCache.Store(cacheKey, newState)
+
+			// Queue the notification asynchronously so the hot path is not blocked by HTTP.
+			select {
+			case s.notifyChan <- endpoint:
+			case <-s.ctx.Done():
+				// shutting down
+			default:
+				logger.Debug("Notification queue full, dropping hole punch notification for %s:%d", endpoint.IP, endpoint.Port)
+				metrics.RecordHolePunchEvent(relayIfname, "queue_full")
+			}
 			s.clearSessionsForIP(endpoint.IP) // Clear sessions for this IP to allow re-establishment
 			metrics.RecordHolePunchEvent(relayIfname, "success")
 		}
 		// Return the buffer to the pool for reuse.
 		bufferPool.Put(packet.data[:1500])
+	}
+}
+
+// endpointNotifierWorker drains the notifyChan and performs the HTTP notification for each
+// hole-punch endpoint. Running several of these keeps latency low even when the server is slow.
+func (s *UDPProxyServer) endpointNotifierWorker() {
+	for {
+		select {
+		case endpoint, ok := <-s.notifyChan:
+			if !ok {
+				return
+			}
+			s.notifyServer(endpoint)
+		case <-s.ctx.Done():
+			return
+		}
 	}
 }
 
@@ -419,6 +494,7 @@ func (s *UDPProxyServer) decryptMessage(encMsg EncryptedHolePunchMessage) ([]byt
 }
 
 func (s *UDPProxyServer) fetchInitialMappings() error {
+	logger.Info("Requesting initial proxy mappings")
 	body := bytes.NewBuffer([]byte(fmt.Sprintf(`{"publicKey": "%s"}`, s.privateKey.PublicKey().String())))
 	resp, err := http.Post(s.serverURL+"/gerbil/get-all-relays", "application/json", body)
 	if err != nil {
@@ -430,24 +506,82 @@ func (s *UDPProxyServer) fetchInitialMappings() error {
 		return fmt.Errorf("server returned non-OK status: %d, body: %s",
 			resp.StatusCode, string(body))
 	}
-	data, err := io.ReadAll(resp.Body)
+	logger.Info("Received initial mappings, streaming decode")
+
+	// Stream-decode the response instead of buffering the entire body
+	// (which can be 100MB+) and then re-walking it with json.Unmarshal.
+	// This both lowers peak memory and lets us start populating the
+	// sync.Map as entries arrive.
+	dec := json.NewDecoder(bufio.NewReaderSize(resp.Body, 1<<20))
+
+	// Expect opening '{' of the top-level object.
+	tok, err := dec.Token()
 	if err != nil {
-		return fmt.Errorf("failed to read response body: %v", err)
+		return fmt.Errorf("failed to read opening token: %v", err)
 	}
-	logger.Info("Received initial mappings: %s", string(data))
-	var initialMappings InitialMappings
-	if err := json.Unmarshal(data, &initialMappings); err != nil {
-		return fmt.Errorf("failed to unmarshal initial mappings: %v", err)
+	if d, ok := tok.(json.Delim); !ok || d != '{' {
+		return fmt.Errorf("expected '{' at top level, got %v", tok)
 	}
-	// Store mappings in our sync.Map.
-	for key, mapping := range initialMappings.Mappings {
-		// Initialize LastUsed timestamp for initial mappings
-		mapping.LastUsed = time.Now()
-		s.proxyMappings.Store(key, mapping)
+
+	count := 0
+	now := time.Now()
+
+	for dec.More() {
+		keyTok, err := dec.Token()
+		if err != nil {
+			return fmt.Errorf("failed to read top-level key: %v", err)
+		}
+		key, ok := keyTok.(string)
+		if !ok {
+			return fmt.Errorf("expected string key at top level, got %T", keyTok)
+		}
+
+		if key != "mappings" {
+			// Skip unknown top-level fields without materializing them.
+			var skip json.RawMessage
+			if err := dec.Decode(&skip); err != nil {
+				return fmt.Errorf("failed to skip field %q: %v", key, err)
+			}
+			continue
+		}
+
+		// Expect opening '{' of the mappings object.
+		tok, err := dec.Token()
+		if err != nil {
+			return fmt.Errorf("failed to read mappings open: %v", err)
+		}
+		if d, ok := tok.(json.Delim); !ok || d != '{' {
+			return fmt.Errorf("expected '{' for mappings, got %v", tok)
+		}
+
+		for dec.More() {
+			mapKeyTok, err := dec.Token()
+			if err != nil {
+				return fmt.Errorf("failed to read mapping key: %v", err)
+			}
+			mapKey, ok := mapKeyTok.(string)
+			if !ok {
+				return fmt.Errorf("expected string mapping key, got %T", mapKeyTok)
+			}
+
+			var mapping ProxyMapping
+			if err := dec.Decode(&mapping); err != nil {
+				return fmt.Errorf("failed to decode mapping %q: %v", mapKey, err)
+			}
+			mapping.LastUsed = now
+			s.proxyMappings.Store(mapKey, mapping)
+			count++
+		}
+
+		// Consume closing '}' of mappings object.
+		if _, err := dec.Token(); err != nil {
+			return fmt.Errorf("failed to read mappings close: %v", err)
+		}
 	}
-	metrics.RecordProxyInitialMappings(relayIfname, int64(len(initialMappings.Mappings)))
-	metrics.RecordProxyMapping(relayIfname, int64(len(initialMappings.Mappings)))
-	logger.Info("Loaded %d initial proxy mappings", len(initialMappings.Mappings))
+
+	metrics.RecordProxyInitialMappings(relayIfname, int64(count))
+	metrics.RecordProxyMapping(relayIfname, int64(count))
+	logger.Info("Loaded %d initial proxy mappings", count)
 	return nil
 }
 
@@ -1163,33 +1297,56 @@ func (s *UDPProxyServer) trackCommunicationPattern(fromAddr, toAddr *net.UDPAddr
 
 // tryRebuildSession attempts to rebuild a WireGuard session from communication patterns
 func (s *UDPProxyServer) tryRebuildSession(pattern *CommunicationPattern) {
+	// Require both indices and a minimum amount of bidirectional traffic
+	if pattern.ClientIndex == 0 || pattern.DestIndex == 0 || pattern.PacketCount < 4 {
+		return
+	}
+
 	// Check if we have bidirectional communication within a reasonable time window
 	timeDiff := pattern.LastFromClient.Sub(pattern.LastFromDest)
 	if timeDiff < 0 {
 		timeDiff = -timeDiff
 	}
-
-	// Only rebuild if we have recent bidirectional communication and both indices
-	if timeDiff < 30*time.Second && pattern.ClientIndex != 0 && pattern.DestIndex != 0 && pattern.PacketCount >= 4 {
-		// Create session mapping: client's index maps to destination
-		sessionKey := fmt.Sprintf("%d:%d", pattern.DestIndex, pattern.ClientIndex)
-
-		// Check if we already have this session
-		session := &WireGuardSession{
-			ReceiverIndex: pattern.DestIndex,
-			SenderIndex:   pattern.ClientIndex,
-			DestAddr:      pattern.ToDestination,
-			LastSeen:      time.Now(),
-		}
-		if _, loaded := s.wgSessions.LoadOrStore(sessionKey, session); loaded {
-			s.wgSessions.Store(sessionKey, session)
-		} else {
-			metrics.RecordSession(relayIfname, 1)
-			metrics.RecordSessionRebuilt(relayIfname)
-		}
-		logger.Info("Rebuilt WireGuard session from communication pattern: %s -> %s (packets: %d)",
-			sessionKey, pattern.ToDestination.String(), pattern.PacketCount)
+	if timeDiff >= 30*time.Second {
+		return
 	}
+
+	sessionKey := fmt.Sprintf("%d:%d", pattern.DestIndex, pattern.ClientIndex)
+	destStr := pattern.ToDestination.String()
+
+	// Fast path: if a matching session already exists, just refresh LastSeen and bail out.
+	// This prevents log spam and repeated work for every packet of an established flow.
+	if existing, ok := s.wgSessions.Load(sessionKey); ok {
+		sess := existing.(*WireGuardSession)
+		if da := sess.GetDestAddr(); da != nil && da.String() == destStr {
+			sess.UpdateLastSeen()
+			// Make sure the receiver-index fast-path is populated so future packets
+			// don't keep falling back to broadcast + pattern tracking.
+			if _, indexed := s.sessionsByReceiverIndex.Load(pattern.ClientIndex); !indexed {
+				s.sessionsByReceiverIndex.Store(pattern.ClientIndex, sess)
+			}
+			return
+		}
+	}
+
+	// Create or replace the session mapping
+	session := &WireGuardSession{
+		ReceiverIndex: pattern.DestIndex,
+		SenderIndex:   pattern.ClientIndex,
+		DestAddr:      pattern.ToDestination,
+		LastSeen:      time.Now(),
+	}
+	if _, loaded := s.wgSessions.LoadOrStore(sessionKey, session); loaded {
+		s.wgSessions.Store(sessionKey, session)
+	} else {
+		metrics.RecordSession(relayIfname, 1)
+		metrics.RecordSessionRebuilt(relayIfname)
+	}
+	// Index by client receiver index so the transport-data fast path can find it.
+	s.sessionsByReceiverIndex.Store(pattern.ClientIndex, session)
+
+	logger.Info("Rebuilt WireGuard session from communication pattern: %s -> %s (packets: %d)",
+		sessionKey, destStr, pattern.PacketCount)
 }
 
 // cleanupIdleCommunicationPatterns periodically removes idle communication patterns
