@@ -1,4 +1,6 @@
 
+GO_VERSION := $(shell cat .go-version 2>/dev/null)
+
 all: build push
 
 docker-build-release:
@@ -7,10 +9,10 @@ docker-build-release:
 		exit 1; \
 	fi
 	docker buildx build --platform linux/arm64,linux/amd64 -t fosrl/gerbil:latest -f Dockerfile --push .
-	docker buildx build --platform linux/arm64,linux/amd64 -t fosrl/gerbil:$(tag) -f Dockerfile --push .
+	docker buildx build --platform linux/arm64,linux/amd64 -t fosrl/gerbil:$(tag) -f Dockerfile --build-arg GO_VERSION=$(GO_VERSION) --push .
 
 build:
-	docker build -t fosrl/gerbil:latest .
+	docker build -t fosrl/gerbil:latest --build-arg GO_VERSION=$(GO_VERSION) .
 
 push:
 	docker push fosrl/gerbil:latest
