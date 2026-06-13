@@ -149,6 +149,13 @@ type cachedEndpointState struct {
 	PublicKey string
 }
 
+// cachedEndpointEntry wraps cachedEndpointState with a timestamp so the cache
+// can be expired after a short TTL even when the endpoint fields are unchanged.
+type cachedEndpointEntry struct {
+	state    cachedEndpointState
+	cachedAt time.Time
+}
+
 // --- End Types ---
 
 // bufferPool allows reusing buffers to reduce allocations.
@@ -406,6 +413,9 @@ func (s *UDPProxyServer) packetWorker() {
 			logger.Debug("Created endpoint from packet remoteAddr %s: IP=%s, Port=%d", packet.remoteAddr.String(), endpoint.IP, endpoint.Port)
 
 			// Check if anything meaningful changed before queuing an HTTP notification.
+			// The cache expires after 2.5 s so the server always receives a fresh
+			// timestamp within its 5-second staleness window.
+			const endpointCacheTTL = 2500 * time.Millisecond
 			cacheKey := endpoint.OlmID + ":" + endpoint.NewtID
 			newState := cachedEndpointState{
 				OlmID:     endpoint.OlmID,
@@ -415,16 +425,19 @@ func (s *UDPProxyServer) packetWorker() {
 				Port:      endpoint.Port,
 				PublicKey: endpoint.ClientPublicKey,
 			}
-			if cached, ok := s.lastEndpointCache.Load(cacheKey); ok && cached.(cachedEndpointState) == newState {
-				// Endpoint unchanged - skip the HTTP call but still clear stale sessions.
-				logger.Debug("Endpoint unchanged for %s, skipping notification", cacheKey)
-				metrics.RecordHolePunchEvent(relayIfname, "deduplicated")
-				s.clearSessionsForIP(endpoint.IP)
-				metrics.RecordHolePunchEvent(relayIfname, "success")
-				bufferPool.Put(packet.data[:1500])
-				continue
+			if cached, ok := s.lastEndpointCache.Load(cacheKey); ok {
+				entry := cached.(cachedEndpointEntry)
+				if entry.state == newState && time.Since(entry.cachedAt) < endpointCacheTTL {
+					// Endpoint unchanged and cache still fresh - skip the HTTP call.
+					logger.Debug("Endpoint unchanged for %s, skipping notification", cacheKey)
+					metrics.RecordHolePunchEvent(relayIfname, "deduplicated")
+					s.clearSessionsForIP(endpoint.IP)
+					metrics.RecordHolePunchEvent(relayIfname, "success")
+					bufferPool.Put(packet.data[:1500])
+					continue
+				}
 			}
-			s.lastEndpointCache.Store(cacheKey, newState)
+			s.lastEndpointCache.Store(cacheKey, cachedEndpointEntry{state: newState, cachedAt: time.Now()})
 
 			// Queue the notification asynchronously so the hot path is not blocked by HTTP.
 			select {
