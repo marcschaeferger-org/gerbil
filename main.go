@@ -46,6 +46,7 @@ var (
 	doTrafficShaping bool
 	bandwidthLimit   string
 	ifbName          string // IFB device name for ingress traffic shaping
+	disableFirewall  bool
 )
 
 type WgConfig struct {
@@ -196,6 +197,7 @@ func main() {
 	proxyProtocolStr := os.Getenv("PROXY_PROTOCOL")
 	doTrafficShapingStr := os.Getenv("DO_TRAFFIC_SHAPING")
 	bandwidthLimitStr := os.Getenv("BANDWIDTH_LIMIT")
+	disableFirewallStr := os.Getenv("DISABLE_FIREWALL")
 
 	// Read metrics env vars (defaults applied by DefaultMetricsConfig; these override defaults).
 	metricsEnabled = true // default
@@ -314,6 +316,13 @@ func main() {
 	}
 	if doTrafficShapingStr == "" {
 		flag.BoolVar(&doTrafficShaping, "do-traffic-shaping", false, "Whether to set up traffic shaping rules for peers (requires tc command and root privileges)")
+	}
+
+	if disableFirewallStr != "" {
+		disableFirewall = strings.ToLower(disableFirewallStr) == "true"
+	}
+	if disableFirewallStr == "" {
+		flag.BoolVar(&disableFirewall, "disable-firewall", false, "Disable WireGuard firewall rules to allow all inbound traffic on the interface")
 	}
 
 	if bandwidthLimitStr != "" {
@@ -732,7 +741,9 @@ func ensureWireguardInterface(wgconfig WgConfig) error {
 		logger.Warn("Failed to ensure MSS clamping: %v", err)
 	}
 
-	if err := ensureWireguardFirewall(); err != nil {
+	if disableFirewall {
+		logger.Warn("Firewall disabled: all inbound traffic on %s will be allowed", interfaceName)
+	} else if err := ensureWireguardFirewall(); err != nil {
 		logger.Warn("Failed to ensure WireGuard firewall rules: %v", err)
 	}
 
