@@ -1504,6 +1504,24 @@ func calculatePeerBandwidth() ([]PeerBandwidth, error) {
 	return peerBandwidths, nil
 }
 
+// defaultBandwidthReportBatchSize caps how many peer bandwidth readings are
+// sent in a single POST. Reporting every peer in one request grows unbounded
+// with fleet size and can exceed the remote server's request body limit,
+// which surfaces as "413 Payload Too Large" and silently drops that whole
+// report cycle. Overridable via GERBIL_BANDWIDTH_BATCH_SIZE.
+const defaultBandwidthReportBatchSize = 250
+
+var bandwidthReportBatchSize = loadBandwidthReportBatchSize()
+
+func loadBandwidthReportBatchSize() int {
+	if v := os.Getenv("GERBIL_BANDWIDTH_BATCH_SIZE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultBandwidthReportBatchSize
+}
+
 func reportPeerBandwidth(apiURL string) error {
 	bandwidths, err := calculatePeerBandwidth()
 	if err != nil {
@@ -1512,26 +1530,47 @@ func reportPeerBandwidth(apiURL string) error {
 		return fmt.Errorf("failed to calculate peer bandwidth: %v", err)
 	}
 
-	jsonData, err := json.Marshal(bandwidths)
+	if len(bandwidths) == 0 {
+		return nil
+	}
+
+	var batchErrs []error
+	for start := 0; start < len(bandwidths); start += bandwidthReportBatchSize {
+		end := start + bandwidthReportBatchSize
+		if end > len(bandwidths) {
+			end = len(bandwidths)
+		}
+
+		if err := sendPeerBandwidthBatch(apiURL, bandwidths[start:end]); err != nil {
+			metrics.RecordBandwidthReport("error")
+			batchErrs = append(batchErrs, err)
+			continue
+		}
+		metrics.RecordBandwidthReport("success")
+	}
+
+	if len(batchErrs) > 0 {
+		return fmt.Errorf("failed to report %d bandwidth batch(es): %w", len(batchErrs), errors.Join(batchErrs...))
+	}
+	return nil
+}
+
+func sendPeerBandwidthBatch(apiURL string, batch []PeerBandwidth) error {
+	jsonData, err := json.Marshal(batch)
 	if err != nil {
-		metrics.RecordBandwidthReport("error")
 		return fmt.Errorf("failed to marshal bandwidth data: %v", err)
 	}
 
 	resp, err := http.Post(apiURL, "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
-		metrics.RecordBandwidthReport("error")
 		return fmt.Errorf("failed to send bandwidth data: %v", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		metrics.RecordBandwidthReport("error")
 		return fmt.Errorf("API returned non-OK status: %s", resp.Status)
 	}
 
-	// Record successful bandwidth report
-	metrics.RecordBandwidthReport("success")
 	return nil
 }
 

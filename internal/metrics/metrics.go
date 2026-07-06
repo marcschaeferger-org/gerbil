@@ -58,6 +58,7 @@ var (
 	udpPacketSizeBytes         observability.Histogram
 	holePunchEventsTotal       observability.Counter
 	proxyMappingActive         observability.UpDownCounter
+	relayUDPConnectionsActive  observability.UpDownCounter
 	sessionRebuiltTotal        observability.Counter
 	commPatternActive          observability.UpDownCounter
 	proxyCleanupRemovedTotal   observability.Counter
@@ -339,6 +340,11 @@ func createInstruments() error {
 	}
 	proxyMappingActive, err = newUpDownCounter("gerbil_proxy_mapping_active",
 		"Number of active proxy mappings", "ifname")
+	if err != nil {
+		return err
+	}
+	relayUDPConnectionsActive, err = newUpDownCounter("gerbil_relay_udp_connections_active",
+		"Number of open per-peer outbound UDP sockets held by the relay connection pool", "ifname")
 	if err != nil {
 		return err
 	}
@@ -709,6 +715,13 @@ func RecordSession(ifname string, delta int64) {
 		return
 	}
 	activeSessions.Add(context.Background(), delta, observability.Labels{"ifname": ifname})
+}
+
+func RecordUDPConnection(ifname string, delta int64) {
+	if relayUDPConnectionsActive == nil {
+		return
+	}
+	relayUDPConnectionsActive.Add(context.Background(), delta, observability.Labels{"ifname": ifname})
 }
 
 func RecordSessionRebuilt(ifname string) {
