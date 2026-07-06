@@ -10,8 +10,11 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"runtime"
+	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fosrl/gerbil/internal/metrics"
@@ -60,8 +63,31 @@ type PeerDestination struct {
 }
 
 type DestinationConn struct {
-	conn     *net.UDPConn
-	lastUsed time.Time
+	conn *net.UDPConn
+	// lastUsed is unix nanoseconds, read/written via atomic ops since it's
+	// touched from packet workers and the response goroutine concurrently
+	// with no lock, and is also scanned for LRU eviction below.
+	lastUsed atomic.Int64
+}
+
+// defaultMaxUDPConnections caps the number of concurrent per-peer outbound
+// UDP sockets the relay will keep open in s.connections. Without a cap, a
+// burst of peer churn creates sockets faster than the 5-minute idle cleanup
+// can reap them, exhausting the host's ephemeral port range or fd ulimit.
+// That surfaces as "dial udp ...: resource temporarily unavailable" on every
+// subsequent packet and pegs the CPU logging the flood (outage 2026-07-03,
+// recurrence 2026-07-05). Overridable via GERBIL_MAX_UDP_CONNECTIONS.
+const defaultMaxUDPConnections = 8192
+
+var maxUDPConnections = loadMaxUDPConnections()
+
+func loadMaxUDPConnections() int64 {
+	if v := os.Getenv("GERBIL_MAX_UDP_CONNECTIONS"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultMaxUDPConnections
 }
 
 // Type for storing WireGuard handshake information
@@ -172,10 +198,13 @@ type UDPProxyServer struct {
 	conn          *net.UDPConn
 	proxyMappings sync.Map // map[string]ProxyMapping where key is "ip:port"
 	connections   sync.Map // map[string]*DestinationConn where key is destination "ip:port"
-	privateKey    wgtypes.Key
-	packetChan    chan Packet
-	ctx           context.Context
-	cancel        context.CancelFunc
+	// connectionCount mirrors len(connections) without an O(n) sync.Map walk,
+	// so the cap check in getOrCreateConnection is cheap on the hot path.
+	connectionCount atomic.Int64
+	privateKey      wgtypes.Key
+	packetChan      chan Packet
+	ctx             context.Context
+	cancel          context.CancelFunc
 
 	// Session tracking for WireGuard peers
 	// Key format: "senderIndex:receiverIndex"
@@ -862,8 +891,15 @@ func (s *UDPProxyServer) getOrCreateConnection(destAddr *net.UDPAddr, remoteAddr
 	// Check if we have an existing connection
 	if conn, ok := s.connections.Load(key); ok {
 		destConn := conn.(*DestinationConn)
-		destConn.lastUsed = time.Now()
+		destConn.lastUsed.Store(time.Now().UnixNano())
 		return destConn.conn, nil
+	}
+
+	// Enforce a hard cap on concurrent sockets so a burst of peer churn can't
+	// exhaust the host's ephemeral ports/fds. Evict the least-recently-used
+	// connection to make room instead of growing unbounded.
+	if s.connectionCount.Load() >= maxUDPConnections {
+		s.evictLRUConnection()
 	}
 
 	// Create new connection
@@ -873,16 +909,49 @@ func (s *UDPProxyServer) getOrCreateConnection(destAddr *net.UDPAddr, remoteAddr
 		return nil, fmt.Errorf("failed to create UDP connection: %v", err)
 	}
 
-	// Store the new connection
-	s.connections.Store(key, &DestinationConn{
-		conn:     newConn,
-		lastUsed: time.Now(),
-	})
+	destConn := &DestinationConn{conn: newConn}
+	destConn.lastUsed.Store(time.Now().UnixNano())
+
+	// Store the new connection. If another goroutine raced us and already
+	// created one for this key, close ours and use theirs instead.
+	if existing, loaded := s.connections.LoadOrStore(key, destConn); loaded {
+		newConn.Close()
+		return existing.(*DestinationConn).conn, nil
+	}
+	s.connectionCount.Add(1)
+	metrics.RecordUDPConnection(relayIfname, 1)
 
 	// Start a goroutine to handle responses
 	go s.handleResponses(newConn, destAddr, remoteAddr)
 
 	return newConn, nil
+}
+
+// evictLRUConnection closes and removes the least-recently-used destination
+// connection so a new one can be created under the concurrent connection cap.
+func (s *UDPProxyServer) evictLRUConnection() {
+	var oldestKey interface{}
+	var oldestConn *DestinationConn
+	var oldestTime int64
+
+	s.connections.Range(func(key, value interface{}) bool {
+		destConn := value.(*DestinationConn)
+		lu := destConn.lastUsed.Load()
+		if oldestKey == nil || lu < oldestTime {
+			oldestKey = key
+			oldestConn = destConn
+			oldestTime = lu
+		}
+		return true
+	})
+
+	if oldestKey != nil {
+		s.connections.Delete(oldestKey)
+		oldestConn.conn.Close()
+		s.connectionCount.Add(-1)
+		metrics.RecordUDPConnection(relayIfname, -1)
+		metrics.RecordProxyCleanupRemoved(relayIfname, "conn_evicted", 1)
+	}
 }
 
 func (s *UDPProxyServer) handleResponses(conn *net.UDPConn, destAddr *net.UDPAddr, remoteAddr *net.UDPAddr) {
@@ -936,22 +1005,32 @@ func (s *UDPProxyServer) handleResponses(conn *net.UDPConn, destAddr *net.UDPAdd
 
 // Add a cleanup method to periodically remove idle connections
 func (s *UDPProxyServer) cleanupIdleConnections() {
-	ticker := time.NewTicker(5 * time.Minute)
+	// Ticker interval and idle threshold were previously 5min/10min, meaning
+	// a socket could sit open for up to 15 minutes after going idle. Under a
+	// reconnect/churn burst that lag is enough to exhaust ephemeral ports
+	// before cleanup catches up, so both are tightened here.
+	ticker := time.NewTicker(1 * time.Minute)
 	defer ticker.Stop()
 	for {
 		select {
 		case <-ticker.C:
 			cleanupStart := time.Now()
-			now := time.Now()
+			now := time.Now().UnixNano()
+			removed := int64(0)
 			s.connections.Range(func(key, value interface{}) bool {
 				destConn := value.(*DestinationConn)
-				if now.Sub(destConn.lastUsed) > 10*time.Minute {
+				if now-destConn.lastUsed.Load() > int64(5*time.Minute) {
 					destConn.conn.Close()
 					s.connections.Delete(key)
-					metrics.RecordProxyCleanupRemoved(relayIfname, "conn", 1)
+					removed++
 				}
 				return true
 			})
+			if removed > 0 {
+				s.connectionCount.Add(-removed)
+				metrics.RecordUDPConnection(relayIfname, -removed)
+				metrics.RecordProxyCleanupRemoved(relayIfname, "conn", removed)
+			}
 			metrics.RecordProxyIdleCleanupDuration(relayIfname, "conn", time.Since(cleanupStart).Seconds())
 		case <-s.ctx.Done():
 			return
@@ -1112,6 +1191,10 @@ func (s *UDPProxyServer) clearConnectionsForWGIP(wgIP string) {
 	// Delete the connections
 	for _, key := range keysToDelete {
 		s.connections.Delete(key)
+	}
+	if len(keysToDelete) > 0 {
+		s.connectionCount.Add(-int64(len(keysToDelete)))
+		metrics.RecordUDPConnection(relayIfname, -int64(len(keysToDelete)))
 	}
 
 	logger.Info("Cleared %d connections for WG IP: %s", len(keysToDelete), wgIP)

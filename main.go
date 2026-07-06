@@ -46,6 +46,7 @@ var (
 	doTrafficShaping bool
 	bandwidthLimit   string
 	ifbName          string // IFB device name for ingress traffic shaping
+	disableFirewall  bool
 )
 
 type WgConfig struct {
@@ -196,6 +197,7 @@ func main() {
 	proxyProtocolStr := os.Getenv("PROXY_PROTOCOL")
 	doTrafficShapingStr := os.Getenv("DO_TRAFFIC_SHAPING")
 	bandwidthLimitStr := os.Getenv("BANDWIDTH_LIMIT")
+	disableFirewallStr := os.Getenv("DISABLE_FIREWALL")
 
 	// Read metrics env vars (defaults applied by DefaultMetricsConfig; these override defaults).
 	metricsEnabled = true // default
@@ -314,6 +316,13 @@ func main() {
 	}
 	if doTrafficShapingStr == "" {
 		flag.BoolVar(&doTrafficShaping, "do-traffic-shaping", false, "Whether to set up traffic shaping rules for peers (requires tc command and root privileges)")
+	}
+
+	if disableFirewallStr != "" {
+		disableFirewall = strings.ToLower(disableFirewallStr) == "true"
+	}
+	if disableFirewallStr == "" {
+		flag.BoolVar(&disableFirewall, "disable-firewall", false, "Disable WireGuard firewall rules to allow all inbound traffic on the interface")
 	}
 
 	if bandwidthLimitStr != "" {
@@ -732,7 +741,9 @@ func ensureWireguardInterface(wgconfig WgConfig) error {
 		logger.Warn("Failed to ensure MSS clamping: %v", err)
 	}
 
-	if err := ensureWireguardFirewall(); err != nil {
+	if disableFirewall {
+		logger.Warn("Firewall disabled: all inbound traffic on %s will be allowed", interfaceName)
+	} else if err := ensureWireguardFirewall(); err != nil {
 		logger.Warn("Failed to ensure WireGuard firewall rules: %v", err)
 	}
 
@@ -1493,6 +1504,24 @@ func calculatePeerBandwidth() ([]PeerBandwidth, error) {
 	return peerBandwidths, nil
 }
 
+// defaultBandwidthReportBatchSize caps how many peer bandwidth readings are
+// sent in a single POST. Reporting every peer in one request grows unbounded
+// with fleet size and can exceed the remote server's request body limit,
+// which surfaces as "413 Payload Too Large" and silently drops that whole
+// report cycle. Overridable via GERBIL_BANDWIDTH_BATCH_SIZE.
+const defaultBandwidthReportBatchSize = 250
+
+var bandwidthReportBatchSize = loadBandwidthReportBatchSize()
+
+func loadBandwidthReportBatchSize() int {
+	if v := os.Getenv("GERBIL_BANDWIDTH_BATCH_SIZE"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultBandwidthReportBatchSize
+}
+
 func reportPeerBandwidth(apiURL string) error {
 	bandwidths, err := calculatePeerBandwidth()
 	if err != nil {
@@ -1501,26 +1530,47 @@ func reportPeerBandwidth(apiURL string) error {
 		return fmt.Errorf("failed to calculate peer bandwidth: %v", err)
 	}
 
-	jsonData, err := json.Marshal(bandwidths)
+	if len(bandwidths) == 0 {
+		return nil
+	}
+
+	var batchErrs []error
+	for start := 0; start < len(bandwidths); start += bandwidthReportBatchSize {
+		end := start + bandwidthReportBatchSize
+		if end > len(bandwidths) {
+			end = len(bandwidths)
+		}
+
+		if err := sendPeerBandwidthBatch(apiURL, bandwidths[start:end]); err != nil {
+			metrics.RecordBandwidthReport("error")
+			batchErrs = append(batchErrs, err)
+			continue
+		}
+		metrics.RecordBandwidthReport("success")
+	}
+
+	if len(batchErrs) > 0 {
+		return fmt.Errorf("failed to report %d bandwidth batch(es): %w", len(batchErrs), errors.Join(batchErrs...))
+	}
+	return nil
+}
+
+func sendPeerBandwidthBatch(apiURL string, batch []PeerBandwidth) error {
+	jsonData, err := json.Marshal(batch)
 	if err != nil {
-		metrics.RecordBandwidthReport("error")
 		return fmt.Errorf("failed to marshal bandwidth data: %v", err)
 	}
 
 	resp, err := http.Post(apiURL, "application/json", bytes.NewBuffer(jsonData))
 	if err != nil {
-		metrics.RecordBandwidthReport("error")
 		return fmt.Errorf("failed to send bandwidth data: %v", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		metrics.RecordBandwidthReport("error")
 		return fmt.Errorf("API returned non-OK status: %s", resp.Status)
 	}
 
-	// Record successful bandwidth report
-	metrics.RecordBandwidthReport("success")
 	return nil
 }
 
