@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"runtime/pprof"
 	"strconv"
@@ -150,8 +151,6 @@ func parseLogLevel(level string) logger.LogLevel {
 }
 
 func main() {
-	go monitorMemory(1024 * 1024 * 512) // trigger if memory usage exceeds 512MB
-
 	var (
 		err                  error
 		wgconfig             WgConfig
@@ -343,6 +342,15 @@ func main() {
 	flag.DurationVar(&otelMetricsTimeout, "otel-metrics-timeout", otelMetricsTimeout, "Timeout for OTLP exporter setup")
 
 	flag.Parse()
+
+	// Heap profiles are dumped into the configured config directory (the same
+	// directory as the config file, or /var/config as a fallback for remote-config
+	// setups) so they land on the volume the operator actually has mounted.
+	heapDir := "/var/config/heap"
+	if configFile != "" {
+		heapDir = filepath.Join(filepath.Dir(configFile), "heap")
+	}
+	go monitorMemory(1024*1024*512, heapDir) // trigger if memory usage exceeds 512MB
 
 	// Derive IFB device name from the WireGuard interface name (Linux limit: 15 chars)
 	ifbName = "ifb_" + interfaceName
@@ -1599,7 +1607,7 @@ func notifyPeerChange(action, publicKey string) {
 	}
 }
 
-func monitorMemory(limit uint64) {
+func monitorMemory(limit uint64, heapDir string) {
 	var m runtime.MemStats
 	for {
 		runtime.ReadMemStats(&m)
@@ -1615,8 +1623,9 @@ func monitorMemory(limit uint64) {
 			// Record memory spike metric
 			metrics.RecordMemorySpike(severity)
 
-			f, err := os.Create(fmt.Sprintf("/var/config/heap/heap-spike-%d.pprof", time.Now().Unix()))
-			if err != nil {
+			if err := os.MkdirAll(heapDir, 0o755); err != nil {
+				log.Println("could not create heap profile directory:", err)
+			} else if f, err := os.Create(filepath.Join(heapDir, fmt.Sprintf("heap-spike-%d.pprof", time.Now().Unix()))); err != nil {
 				log.Println("could not create profile:", err)
 			} else {
 				pprof.WriteHeapProfile(f)
