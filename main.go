@@ -751,7 +751,7 @@ func ensureWireguardInterface(wgconfig WgConfig) error {
 
 	if disableFirewall {
 		logger.Warn("Firewall disabled: all inbound traffic on %s will be allowed", interfaceName)
-	} else if err := ensureWireguardFirewall(); err != nil {
+	} else if err := ensureWireguardFirewall(wgconfig.IpAddress); err != nil {
 		logger.Warn("Failed to ensure WireGuard firewall rules: %v", err)
 	}
 
@@ -927,11 +927,18 @@ func ensureMSSClamping() error {
 	return nil
 }
 
-func ensureWireguardFirewall() error {
+func ensureWireguardFirewall(localIpAddress string) error {
 	// Rules to enforce:
 	// 1. Allow established/related connections (responses to our outbound traffic)
 	// 2. Allow ICMP ping packets
-	// 3. Drop all other inbound traffic from peers
+	// 3. Allow inbound traffic to ports 80/443 on the local IP only (for Traefik)
+	// 4. Drop all other inbound traffic from peers
+
+	// Strip any CIDR suffix so we're left with just the host IP
+	localIp := localIpAddress
+	if ip, _, err := net.ParseCIDR(localIpAddress); err == nil {
+		localIp = ip.String()
+	}
 
 	// Define the rules we want to ensure exist
 	rules := [][]string{
@@ -949,6 +956,24 @@ func ensureWireguardFirewall() error {
 			"-i", interfaceName,
 			"-p", "icmp",
 			"--icmp-type", "8",
+			"-j", "ACCEPT",
+		},
+		// Allow inbound HTTP to the local IP only (for Traefik)
+		{
+			"-A", "INPUT",
+			"-i", interfaceName,
+			"-p", "tcp",
+			"--dport", "80",
+			"-d", localIp,
+			"-j", "ACCEPT",
+		},
+		// Allow inbound HTTPS to the local IP only (for Traefik)
+		{
+			"-A", "INPUT",
+			"-i", interfaceName,
+			"-p", "tcp",
+			"--dport", "443",
+			"-d", localIp,
 			"-j", "ACCEPT",
 		},
 		// Drop all other inbound traffic from WireGuard interface
