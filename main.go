@@ -11,6 +11,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	_ "net/http/pprof"
 	"os"
 	"os/exec"
@@ -102,6 +103,53 @@ type UpdateDestinationsRequest struct {
 	SourceIP     string                  `json:"sourceIp"`
 	SourcePort   int                     `json:"sourcePort"`
 	Destinations []relay.PeerDestination `json:"destinations"`
+}
+
+// pangolinDestHeader carries the downstream host:port (reachable over the
+// WireGuard interface) that a /router request should be rewritten to. It is
+// stripped before the request is forwarded.
+const pangolinDestHeader = "p-dest-header"
+
+// routerProxy forwards /router/* requests from the Pangolin AI gateway to a
+// destination on the WireGuard network, as named by pangolinDestHeader.
+// Used for proxying AI chat completion requests (incl. streaming) to
+// providers reachable only from a site.
+var routerProxy = &httputil.ReverseProxy{
+	Rewrite: func(pr *httputil.ProxyRequest) {
+		dest := pr.In.Header.Get(pangolinDestHeader)
+
+		pr.Out.URL.Scheme = "http"
+		pr.Out.URL.Host = dest
+		pr.Out.URL.Path = strings.TrimPrefix(pr.In.URL.Path, "/router")
+		if !strings.HasPrefix(pr.Out.URL.Path, "/") {
+			pr.Out.URL.Path = "/" + pr.Out.URL.Path
+		}
+		pr.Out.URL.RawPath = ""
+		pr.Out.Host = dest
+
+		pr.Out.Header.Del(pangolinDestHeader)
+	},
+	// Flush written bytes to the client immediately rather than buffering,
+	// which is required for SSE-based streaming chat completions.
+	FlushInterval: -1,
+	ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+		logger.Error("Router proxy error for %s: %v", r.URL.Path, err)
+		http.Error(w, "Bad gateway", http.StatusBadGateway)
+	},
+}
+
+func handleRouter(w http.ResponseWriter, r *http.Request) {
+	dest := r.Header.Get(pangolinDestHeader)
+	if dest == "" {
+		http.Error(w, fmt.Sprintf("Missing %s header", pangolinDestHeader), http.StatusBadRequest)
+		return
+	}
+	if _, _, err := net.SplitHostPort(dest); err != nil {
+		http.Error(w, "Invalid destination", http.StatusBadRequest)
+		return
+	}
+
+	routerProxy.ServeHTTP(w, r)
 }
 
 // httpMetricsMiddleware wraps HTTP handlers with metrics tracking
@@ -568,6 +616,7 @@ func main() {
 	http.HandleFunc("/update-destinations", httpMetricsMiddleware("update_destinations", handleUpdateDestinations))
 	http.HandleFunc("/update-local-snis", httpMetricsMiddleware("update_local_snis", handleUpdateLocalSNIs))
 	http.HandleFunc("/healthz", httpMetricsMiddleware("healthz", handleHealthz))
+	http.HandleFunc("/router/", httpMetricsMiddleware("router", handleRouter))
 
 	// Register metrics endpoint only for Prometheus backend.
 	// OTel backend pushes to a collector; no /metrics endpoint needed.
