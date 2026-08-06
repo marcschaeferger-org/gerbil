@@ -106,9 +106,19 @@ type UpdateDestinationsRequest struct {
 }
 
 // pangolinDestHeader carries the downstream host:port (reachable over the
-// WireGuard interface) that a /router request should be rewritten to. It is
+// WireGuard interface) that a /router request should be rewritten to,
+// optionally prefixed with a scheme (e.g. "https://100.96.128.1:443"). It is
 // stripped before the request is forwarded.
 const pangolinDestHeader = "p-dest-header"
+
+// splitDestHeader separates an optional "scheme://" prefix from a
+// pangolinDestHeader value, defaulting to "http" when none is present.
+func splitDestHeader(dest string) (scheme, host string) {
+	if s, rest, ok := strings.Cut(dest, "://"); ok {
+		return s, rest
+	}
+	return "http", dest
+}
 
 // routerProxy forwards /router/* requests from the Pangolin AI gateway to a
 // destination on the WireGuard network, as named by pangolinDestHeader.
@@ -116,9 +126,9 @@ const pangolinDestHeader = "p-dest-header"
 // providers reachable only from a site.
 var routerProxy = &httputil.ReverseProxy{
 	Rewrite: func(pr *httputil.ProxyRequest) {
-		dest := pr.In.Header.Get(pangolinDestHeader)
+		scheme, dest := splitDestHeader(pr.In.Header.Get(pangolinDestHeader))
 
-		pr.Out.URL.Scheme = "http"
+		pr.Out.URL.Scheme = scheme
 		pr.Out.URL.Host = dest
 		pr.Out.URL.Path = strings.TrimPrefix(pr.In.URL.Path, "/router")
 		if !strings.HasPrefix(pr.Out.URL.Path, "/") {
@@ -144,7 +154,8 @@ func handleRouter(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("Missing %s header", pangolinDestHeader), http.StatusBadRequest)
 		return
 	}
-	if _, _, err := net.SplitHostPort(dest); err != nil {
+	_, host := splitDestHeader(dest)
+	if _, _, err := net.SplitHostPort(host); err != nil {
 		http.Error(w, "Invalid destination", http.StatusBadRequest)
 		return
 	}
