@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -111,6 +112,14 @@ type UpdateDestinationsRequest struct {
 // stripped before the request is forwarded.
 const pangolinDestHeader = "p-dest-header"
 
+// pangolinHostHeader optionally carries the Host header value that should be
+// sent to the destination, when it differs from pangolinDestHeader (e.g. the
+// target's configured IP/hostname rather than the WireGuard routing
+// address). It is stripped before the request is forwarded. When absent,
+// the destination from pangolinDestHeader is used as the Host header, same
+// as before.
+const pangolinHostHeader = "p-dest-host-header"
+
 // splitDestHeader separates an optional "scheme://" prefix from a
 // pangolinDestHeader value, defaulting to "http" when none is present.
 func splitDestHeader(dest string) (scheme, host string) {
@@ -118,6 +127,65 @@ func splitDestHeader(dest string) (scheme, host string) {
 		return s, rest
 	}
 	return "http", dest
+}
+
+// hostname strips an optional ":port" suffix from a host header value.
+func hostname(hostport string) string {
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		return h
+	}
+	return hostport
+}
+
+// routerSNIContextKey carries the TLS ServerName (SNI) that
+// routerTransport's DialTLSContext should present, since we dial the
+// WireGuard destination IP but the remote end typically terminates TLS
+// based on the original hostname (pangolinHostHeader), not that IP.
+type routerSNIContextKey struct{}
+
+// routerTransport is routerProxy's RoundTripper. It mirrors
+// http.DefaultTransport except for TLS dials, where it sets the SNI from
+// routerSNIContextKey instead of letting it default to the dial address
+// (the WireGuard IP), which the destination's TLS termination won't have a
+// matching certificate/route for.
+var routerTransport = &http.Transport{
+	Proxy: http.ProxyFromEnvironment,
+	DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+		serverName := hostname(addr)
+		if sni, ok := ctx.Value(routerSNIContextKey{}).(string); ok && sni != "" {
+			serverName = sni
+		}
+		dialer := &tls.Dialer{Config: &tls.Config{ServerName: serverName}}
+		return dialer.DialContext(ctx, network, addr)
+	},
+}
+
+// logDebugRequest dumps a request's destination, headers, and body at debug
+// level for troubleshooting (e.g. verifying an auth header made it through
+// the proxy chain intact). It reads and restores req.Body so the request can
+// still be sent afterward. Header values (including secrets like API keys)
+// are logged as-is - only intended to be enabled for local troubleshooting.
+func logDebugRequest(label string, req *http.Request) {
+	var headerLines strings.Builder
+	for name, values := range req.Header {
+		for _, v := range values {
+			fmt.Fprintf(&headerLines, "\n  %s: %s", name, v)
+		}
+	}
+
+	body := []byte("<empty>")
+	if req.Body != nil {
+		data, err := io.ReadAll(req.Body)
+		req.Body.Close()
+		if err != nil {
+			logger.Error("%s: failed to read body for logging: %v", label, err)
+		} else {
+			body = data
+		}
+		req.Body = io.NopCloser(bytes.NewReader(data))
+	}
+
+	logger.Debug("%s: %s %s://%s%s headers:%s\nbody: %s", label, req.Method, req.URL.Scheme, req.Host, req.URL.RequestURI(), headerLines.String(), body)
 }
 
 // routerProxy forwards /router/* requests from the Pangolin AI gateway to a
@@ -136,9 +204,19 @@ var routerProxy = &httputil.ReverseProxy{
 		}
 		pr.Out.URL.RawPath = ""
 		pr.Out.Host = dest
+		if hostOverride := pr.In.Header.Get(pangolinHostHeader); hostOverride != "" {
+			pr.Out.Host = hostOverride
+			ctx := context.WithValue(pr.Out.Context(), routerSNIContextKey{}, hostname(hostOverride))
+			pr.Out = pr.Out.WithContext(ctx)
+		}
 
 		pr.Out.Header.Del(pangolinDestHeader)
+		pr.Out.Header.Del(pangolinHostHeader)
+
+		logger.Debug("Router proxy: %s %s -> %s (Host: %s)", pr.In.Method, pr.In.URL.Path, pr.Out.URL.String(), pr.Out.Host)
+		logDebugRequest("Router outbound request", pr.Out)
 	},
+	Transport: routerTransport,
 	// Flush written bytes to the client immediately rather than buffering,
 	// which is required for SSE-based streaming chat completions.
 	FlushInterval: -1,
@@ -150,6 +228,9 @@ var routerProxy = &httputil.ReverseProxy{
 
 func handleRouter(w http.ResponseWriter, r *http.Request) {
 	dest := r.Header.Get(pangolinDestHeader)
+	hostOverride := r.Header.Get(pangolinHostHeader)
+	logger.Debug("Router request received: %s %s dest=%s host=%s remote=%s", r.Method, r.URL.Path, dest, hostOverride, r.RemoteAddr)
+
 	if dest == "" {
 		http.Error(w, fmt.Sprintf("Missing %s header", pangolinDestHeader), http.StatusBadRequest)
 		return
