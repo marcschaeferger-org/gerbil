@@ -273,6 +273,16 @@ func (w *responseWriterWrapper) WriteHeader(statusCode int) {
 	w.ResponseWriter.WriteHeader(statusCode)
 }
 
+// Unwrap exposes the underlying ResponseWriter so http.ResponseController
+// (used by httputil.ReverseProxy's streaming Flush, and by Hijack/Push
+// callers) can see through this wrapper to the real http.Flusher etc.
+// Without this, ReverseProxy's flushes on /router/* silently no-op and
+// streamed responses (e.g. SSE) get buffered until the response completes
+// instead of being forwarded incrementally.
+func (w *responseWriterWrapper) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
+}
+
 func parseLogLevel(level string) logger.LogLevel {
 	switch strings.ToUpper(level) {
 	case "DEBUG":
