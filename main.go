@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -11,6 +12,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/httputil"
 	_ "net/http/pprof"
 	"os"
 	"os/exec"
@@ -104,6 +106,144 @@ type UpdateDestinationsRequest struct {
 	Destinations []relay.PeerDestination `json:"destinations"`
 }
 
+// pangolinDestHeader carries the downstream host:port (reachable over the
+// WireGuard interface) that a /router request should be rewritten to,
+// optionally prefixed with a scheme (e.g. "https://100.96.128.1:443"). It is
+// stripped before the request is forwarded.
+const pangolinDestHeader = "p-dest-header"
+
+// pangolinHostHeader optionally carries the Host header value that should be
+// sent to the destination, when it differs from pangolinDestHeader (e.g. the
+// target's configured IP/hostname rather than the WireGuard routing
+// address). It is stripped before the request is forwarded. When absent,
+// the destination from pangolinDestHeader is used as the Host header, same
+// as before.
+const pangolinHostHeader = "p-dest-host-header"
+
+// splitDestHeader separates an optional "scheme://" prefix from a
+// pangolinDestHeader value, defaulting to "http" when none is present.
+func splitDestHeader(dest string) (scheme, host string) {
+	if s, rest, ok := strings.Cut(dest, "://"); ok {
+		return s, rest
+	}
+	return "http", dest
+}
+
+// hostname strips an optional ":port" suffix from a host header value.
+func hostname(hostport string) string {
+	if h, _, err := net.SplitHostPort(hostport); err == nil {
+		return h
+	}
+	return hostport
+}
+
+// routerSNIContextKey carries the TLS ServerName (SNI) that
+// routerTransport's DialTLSContext should present, since we dial the
+// WireGuard destination IP but the remote end typically terminates TLS
+// based on the original hostname (pangolinHostHeader), not that IP.
+type routerSNIContextKey struct{}
+
+// routerTransport is routerProxy's RoundTripper. It mirrors
+// http.DefaultTransport except for TLS dials, where it sets the SNI from
+// routerSNIContextKey instead of letting it default to the dial address
+// (the WireGuard IP), which the destination's TLS termination won't have a
+// matching certificate/route for.
+var routerTransport = &http.Transport{
+	Proxy: http.ProxyFromEnvironment,
+	DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+		serverName := hostname(addr)
+		if sni, ok := ctx.Value(routerSNIContextKey{}).(string); ok && sni != "" {
+			serverName = sni
+		}
+		dialer := &tls.Dialer{Config: &tls.Config{ServerName: serverName}}
+		return dialer.DialContext(ctx, network, addr)
+	},
+}
+
+// logDebugRequest dumps a request's destination, headers, and body at debug
+// level for troubleshooting (e.g. verifying an auth header made it through
+// the proxy chain intact). It reads and restores req.Body so the request can
+// still be sent afterward. Header values (including secrets like API keys)
+// are logged as-is - only intended to be enabled for local troubleshooting.
+func logDebugRequest(label string, req *http.Request) {
+	var headerLines strings.Builder
+	for name, values := range req.Header {
+		for _, v := range values {
+			fmt.Fprintf(&headerLines, "\n  %s: %s", name, v)
+		}
+	}
+
+	body := []byte("<empty>")
+	if req.Body != nil {
+		data, err := io.ReadAll(req.Body)
+		req.Body.Close()
+		if err != nil {
+			logger.Error("%s: failed to read body for logging: %v", label, err)
+		} else {
+			body = data
+		}
+		req.Body = io.NopCloser(bytes.NewReader(data))
+	}
+
+	logger.Debug("%s: %s %s://%s%s headers:%s\nbody: %s", label, req.Method, req.URL.Scheme, req.Host, req.URL.RequestURI(), headerLines.String(), body)
+}
+
+// routerProxy forwards /router/* requests from the Pangolin AI gateway to a
+// destination on the WireGuard network, as named by pangolinDestHeader.
+// Used for proxying AI chat completion requests (incl. streaming) to
+// providers reachable only from a site.
+var routerProxy = &httputil.ReverseProxy{
+	Rewrite: func(pr *httputil.ProxyRequest) {
+		scheme, dest := splitDestHeader(pr.In.Header.Get(pangolinDestHeader))
+
+		pr.Out.URL.Scheme = scheme
+		pr.Out.URL.Host = dest
+		pr.Out.URL.Path = strings.TrimPrefix(pr.In.URL.Path, "/router")
+		if !strings.HasPrefix(pr.Out.URL.Path, "/") {
+			pr.Out.URL.Path = "/" + pr.Out.URL.Path
+		}
+		pr.Out.URL.RawPath = ""
+		pr.Out.Host = dest
+		if hostOverride := pr.In.Header.Get(pangolinHostHeader); hostOverride != "" {
+			pr.Out.Host = hostOverride
+			ctx := context.WithValue(pr.Out.Context(), routerSNIContextKey{}, hostname(hostOverride))
+			pr.Out = pr.Out.WithContext(ctx)
+		}
+
+		pr.Out.Header.Del(pangolinDestHeader)
+		pr.Out.Header.Del(pangolinHostHeader)
+
+		logger.Debug("Router proxy: %s %s -> %s (Host: %s)", pr.In.Method, pr.In.URL.Path, pr.Out.URL.String(), pr.Out.Host)
+		logDebugRequest("Router outbound request", pr.Out)
+	},
+	Transport: routerTransport,
+	// Flush written bytes to the client immediately rather than buffering,
+	// which is required for SSE-based streaming chat completions.
+	FlushInterval: -1,
+	ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+		logger.Error("Router proxy error for %s: %v", r.URL.Path, err)
+		http.Error(w, "Bad gateway", http.StatusBadGateway)
+	},
+}
+
+func handleRouter(w http.ResponseWriter, r *http.Request) {
+	dest := r.Header.Get(pangolinDestHeader)
+	hostOverride := r.Header.Get(pangolinHostHeader)
+	logger.Debug("Router request received: %s %s dest=%s host=%s remote=%s", r.Method, r.URL.Path, dest, hostOverride, r.RemoteAddr)
+
+	if dest == "" {
+		http.Error(w, fmt.Sprintf("Missing %s header", pangolinDestHeader), http.StatusBadRequest)
+		return
+	}
+	_, host := splitDestHeader(dest)
+	if _, _, err := net.SplitHostPort(host); err != nil {
+		http.Error(w, "Invalid destination", http.StatusBadRequest)
+		return
+	}
+
+	routerProxy.ServeHTTP(w, r)
+}
+
 // httpMetricsMiddleware wraps HTTP handlers with metrics tracking
 func httpMetricsMiddleware(endpoint string, handler http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
@@ -131,6 +271,16 @@ type responseWriterWrapper struct {
 func (w *responseWriterWrapper) WriteHeader(statusCode int) {
 	w.statusCode = statusCode
 	w.ResponseWriter.WriteHeader(statusCode)
+}
+
+// Unwrap exposes the underlying ResponseWriter so http.ResponseController
+// (used by httputil.ReverseProxy's streaming Flush, and by Hijack/Push
+// callers) can see through this wrapper to the real http.Flusher etc.
+// Without this, ReverseProxy's flushes on /router/* silently no-op and
+// streamed responses (e.g. SSE) get buffered until the response completes
+// instead of being forwarded incrementally.
+func (w *responseWriterWrapper) Unwrap() http.ResponseWriter {
+	return w.ResponseWriter
 }
 
 func parseLogLevel(level string) logger.LogLevel {
@@ -568,6 +718,7 @@ func main() {
 	http.HandleFunc("/update-destinations", httpMetricsMiddleware("update_destinations", handleUpdateDestinations))
 	http.HandleFunc("/update-local-snis", httpMetricsMiddleware("update_local_snis", handleUpdateLocalSNIs))
 	http.HandleFunc("/healthz", httpMetricsMiddleware("healthz", handleHealthz))
+	http.HandleFunc("/router/", httpMetricsMiddleware("router", handleRouter))
 
 	// Register metrics endpoint only for Prometheus backend.
 	// OTel backend pushes to a collector; no /metrics endpoint needed.
@@ -751,7 +902,7 @@ func ensureWireguardInterface(wgconfig WgConfig) error {
 
 	if disableFirewall {
 		logger.Warn("Firewall disabled: all inbound traffic on %s will be allowed", interfaceName)
-	} else if err := ensureWireguardFirewall(); err != nil {
+	} else if err := ensureWireguardFirewall(wgconfig.IpAddress); err != nil {
 		logger.Warn("Failed to ensure WireGuard firewall rules: %v", err)
 	}
 
@@ -927,11 +1078,18 @@ func ensureMSSClamping() error {
 	return nil
 }
 
-func ensureWireguardFirewall() error {
+func ensureWireguardFirewall(localIpAddress string) error {
 	// Rules to enforce:
 	// 1. Allow established/related connections (responses to our outbound traffic)
 	// 2. Allow ICMP ping packets
-	// 3. Drop all other inbound traffic from peers
+	// 3. Allow inbound traffic to ports 80/443 on the local IP only (for Traefik)
+	// 4. Drop all other inbound traffic from peers
+
+	// Strip any CIDR suffix so we're left with just the host IP
+	localIp := localIpAddress
+	if ip, _, err := net.ParseCIDR(localIpAddress); err == nil {
+		localIp = ip.String()
+	}
 
 	// Define the rules we want to ensure exist
 	rules := [][]string{
@@ -949,6 +1107,24 @@ func ensureWireguardFirewall() error {
 			"-i", interfaceName,
 			"-p", "icmp",
 			"--icmp-type", "8",
+			"-j", "ACCEPT",
+		},
+		// Allow inbound HTTP to the local IP only (for Traefik)
+		{
+			"-A", "INPUT",
+			"-i", interfaceName,
+			"-p", "tcp",
+			"--dport", "80",
+			"-d", localIp,
+			"-j", "ACCEPT",
+		},
+		// Allow inbound HTTPS to the local IP only (for Traefik)
+		{
+			"-A", "INPUT",
+			"-i", interfaceName,
+			"-p", "tcp",
+			"--dport", "443",
+			"-d", localIp,
 			"-j", "ACCEPT",
 		},
 		// Drop all other inbound traffic from WireGuard interface
