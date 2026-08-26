@@ -11,15 +11,57 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/fosrl/gerbil/internal/metrics"
 	"github.com/fosrl/gerbil/logger"
 	"github.com/patrickmn/go-cache"
 )
+
+// defaultMaxSNIConnections caps the number of concurrent client connections
+// the SNI proxy will accept. Without a cap, a burst of connections (a
+// scanner sweep, a client reconnect storm) spawns unbounded goroutines each
+// holding copy buffers and sockets, exhausting container memory faster than
+// GC/backpressure can catch up.
+// Sized conservatively since each connection now holds up to two pooled
+// 32KB copy buffers once the buffer pool is actually honored (see
+// bufferedReader/bufferedWriter below). Overridable via
+// GERBIL_MAX_SNI_CONNECTIONS.
+const defaultMaxSNIConnections = 4096
+
+var maxSNIConnections = loadMaxSNIConnections()
+
+func loadMaxSNIConnections() int64 {
+	if v := os.Getenv("GERBIL_MAX_SNI_CONNECTIONS"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultMaxSNIConnections
+}
+
+// defaultMaxSNIConnectionsPerIP caps concurrent connections from a single
+// source IP, independent of the global maxSNIConnections budget. Without
+// this, one noisy/misbehaving client (or a single scanning host) can
+// consume the entire global budget and lock out every other customer
+// sharing this proxy. Overridable via GERBIL_MAX_SNI_CONNECTIONS_PER_IP.
+const defaultMaxSNIConnectionsPerIP = 256
+
+var maxSNIConnectionsPerIP = loadMaxSNIConnectionsPerIP()
+
+func loadMaxSNIConnectionsPerIP() int64 {
+	if v := os.Getenv("GERBIL_MAX_SNI_CONNECTIONS_PER_IP"); v != "" {
+		if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+			return n
+		}
+	}
+	return defaultMaxSNIConnectionsPerIP
+}
 
 // RouteRecord represents a routing configuration
 type RouteRecord struct {
@@ -76,6 +118,18 @@ type SNIProxy struct {
 
 	// Buffer pool for connection piping
 	bufferPool *sync.Pool
+
+	// activeConnections tracks concurrent client connections so
+	// acceptConnections can enforce maxSNIConnections.
+	activeConnections atomic.Int64
+
+	// perIPConnections tracks concurrent connections per source IP (map[string]*atomic.Int64)
+	// so acceptConnections can enforce maxSNIConnectionsPerIP and stop one
+	// client from starving the rest. Entries are removed once a given IP's
+	// count returns to zero, so this stays bounded by currently-connected
+	// distinct IPs (itself bounded by maxSNIConnections) rather than growing
+	// with every IP ever seen.
+	perIPConnections sync.Map
 }
 
 type activeTunnel struct {
@@ -458,8 +512,46 @@ func (p *SNIProxy) acceptConnections() {
 			}
 		}
 
+		if p.activeConnections.Load() >= maxSNIConnections {
+			logger.Debug("Max concurrent SNI connections (%d) reached, rejecting connection from %s", maxSNIConnections, conn.RemoteAddr())
+			metrics.RecordSNIConnection("rejected_max_connections")
+			conn.Close()
+			continue
+		}
+
+		remoteHost, _, err := net.SplitHostPort(conn.RemoteAddr().String())
+		if err != nil {
+			remoteHost = conn.RemoteAddr().String()
+		}
+
+		counterVal, _ := p.perIPConnections.LoadOrStore(remoteHost, new(atomic.Int64))
+		perIPCounter := counterVal.(*atomic.Int64)
+		if perIPCounter.Load() >= maxSNIConnectionsPerIP {
+			logger.Debug("Max concurrent SNI connections per IP (%d) reached for %s, rejecting connection", maxSNIConnectionsPerIP, remoteHost)
+			metrics.RecordSNIConnection("rejected_per_ip_limit")
+			conn.Close()
+			continue
+		}
+		perIPCounter.Add(1)
+
+		p.activeConnections.Add(1)
+		metrics.RecordSNIActiveConnection(1)
 		p.wg.Add(1)
-		go p.handleConnection(conn)
+		go func() {
+			defer func() {
+				if perIPCounter.Add(-1) == 0 {
+					// Best-effort cleanup: only remove the map entry if it
+					// still holds this exact counter (a concurrent new
+					// connection from the same IP may have already bumped
+					// it back up via LoadOrStore, or replaced it after a
+					// prior race). Undercounting in that narrow race window
+					// just means one connection isn't rate-limited briefly,
+					// never unbounded growth.
+					p.perIPConnections.CompareAndDelete(remoteHost, counterVal)
+				}
+			}()
+			p.handleConnection(conn)
+		}()
 	}
 }
 
@@ -507,6 +599,10 @@ func (p *SNIProxy) extractSNI(conn net.Conn) (string, io.Reader, error) {
 func (p *SNIProxy) handleConnection(clientConn net.Conn) {
 	defer p.wg.Done()
 	defer clientConn.Close()
+	defer func() {
+		p.activeConnections.Add(-1)
+		metrics.RecordSNIActiveConnection(-1)
+	}()
 
 	metrics.RecordSNIConnection("accepted")
 
@@ -793,6 +889,23 @@ func (p *SNIProxy) selectStickyEndpoint(clientAddr string, endpoints []string) s
 	return endpoints[index]
 }
 
+// bufferedReader hides any io.WriterTo the wrapped reader implements (e.g.
+// io.MultiReader, used by peekClientHello to replay the buffered
+// ClientHello ahead of the raw connection). Without this, io.CopyBuffer
+// bypasses the caller-supplied buffer entirely and lets WriteTo drive its
+// own, uncapped allocations - defeating the point of bufferPool.
+type bufferedReader struct {
+	io.Reader
+}
+
+// bufferedWriter hides any io.ReaderFrom the wrapped writer implements (e.g.
+// *net.TCPConn's splice/sendfile fast path). Without this, io.CopyBuffer
+// bypasses the caller-supplied buffer here too, so each copy allocates and
+// manages its own buffer regardless of what's pooled.
+type bufferedWriter struct {
+	io.Writer
+}
+
 // pipe handles bidirectional data transfer between connections
 func (p *SNIProxy) pipe(hostname string, clientConn, targetConn net.Conn, clientReader io.Reader) {
 	var wg sync.WaitGroup
@@ -821,7 +934,7 @@ func (p *SNIProxy) pipe(hostname string, clientConn, targetConn net.Conn, client
 			p.bufferPool.Put(bufPtr)
 		}()
 
-		bytesCopied, err := io.CopyBuffer(targetConn, clientReader, *bufPtr)
+		bytesCopied, err := io.CopyBuffer(bufferedWriter{targetConn}, bufferedReader{clientReader}, *bufPtr)
 		metrics.RecordProxyBytesTransmitted("client_to_target", bytesCopied)
 		if err != nil && err != io.EOF {
 			logger.Debug("Copy client->target error: %v", err)
@@ -841,7 +954,7 @@ func (p *SNIProxy) pipe(hostname string, clientConn, targetConn net.Conn, client
 			p.bufferPool.Put(bufPtr)
 		}()
 
-		bytesCopied, err := io.CopyBuffer(clientConn, targetConn, *bufPtr)
+		bytesCopied, err := io.CopyBuffer(bufferedWriter{clientConn}, bufferedReader{targetConn}, *bufPtr)
 		metrics.RecordProxyBytesTransmitted("target_to_client", bytesCopied)
 		if err != nil && err != io.EOF {
 			logger.Debug("Copy target->client error: %v", err)
