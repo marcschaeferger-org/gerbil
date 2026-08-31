@@ -10,9 +10,11 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"runtime"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -195,6 +197,7 @@ var bufferPool = sync.Pool{
 type UDPProxyServer struct {
 	addr          string
 	serverURL     string
+	httpClient    *http.Client
 	conn          *net.UDPConn
 	proxyMappings sync.Map // map[string]ProxyMapping where key is "ip:port"
 	connections   sync.Map // map[string]*DestinationConn where key is destination "ip:port"
@@ -230,19 +233,67 @@ type UDPProxyServer struct {
 	ReachableAt string
 }
 
+// ValidateRemoteConfigURL ensures control-plane traffic is encrypted unless
+// plaintext HTTP was explicitly enabled for development.
+func ValidateRemoteConfigURL(serverURL string, allowInsecureHTTP bool) error {
+	u, err := url.Parse(serverURL)
+	if err != nil {
+		return fmt.Errorf("invalid remote config URL: %w", err)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("remote config URL must include a host")
+	}
+
+	switch strings.ToLower(u.Scheme) {
+	case "https":
+		return nil
+	case "http":
+		if allowInsecureHTTP {
+			return nil
+		}
+		return fmt.Errorf("remote config URL must use HTTPS (plaintext HTTP is allowed only with the development override)")
+	default:
+		return fmt.Errorf("remote config URL must use HTTPS")
+	}
+}
+
+// NewControlPlaneHTTPClient returns a client that preserves the remote-config
+// transport policy across redirects and bounds waits for response headers.
+func NewControlPlaneHTTPClient(allowInsecureHTTP bool) *http.Client {
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.ResponseHeaderTimeout = 30 * time.Second
+
+	return &http.Client{
+		Transport: transport,
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			if len(via) >= 10 {
+				return fmt.Errorf("stopped after 10 redirects")
+			}
+			return ValidateRemoteConfigURL(req.URL.String(), allowInsecureHTTP)
+		},
+	}
+}
+
 // NewUDPProxyServer initializes the server with a buffered packet channel and derived context.
-func NewUDPProxyServer(parentCtx context.Context, addr, serverURL string, privateKey wgtypes.Key, reachableAt string) *UDPProxyServer {
+func NewUDPProxyServer(parentCtx context.Context, addr, serverURL string, privateKey wgtypes.Key, reachableAt string, allowInsecureHTTP bool) (*UDPProxyServer, error) {
+	if serverURL != "" {
+		if err := ValidateRemoteConfigURL(serverURL, allowInsecureHTTP); err != nil {
+			return nil, err
+		}
+	}
+
 	ctx, cancel := context.WithCancel(parentCtx)
 	return &UDPProxyServer{
 		addr:        addr,
 		serverURL:   serverURL,
+		httpClient:  NewControlPlaneHTTPClient(allowInsecureHTTP),
 		privateKey:  privateKey,
 		packetChan:  make(chan Packet, 50000), // Increased from 1000 to handle high throughput
 		notifyChan:  make(chan ClientEndpoint, 1000),
 		ReachableAt: reachableAt,
 		ctx:         ctx,
 		cancel:      cancel,
-	}
+	}, nil
 }
 
 // Start sets up the UDP listener, worker pool, and begins reading packets.
@@ -538,7 +589,12 @@ func (s *UDPProxyServer) decryptMessage(encMsg EncryptedHolePunchMessage) ([]byt
 func (s *UDPProxyServer) fetchInitialMappings() error {
 	logger.Info("Requesting initial proxy mappings")
 	body := bytes.NewBuffer([]byte(fmt.Sprintf(`{"publicKey": "%s"}`, s.privateKey.PublicKey().String())))
-	resp, err := http.Post(s.serverURL+"/gerbil/get-all-relays", "application/json", body)
+	req, err := http.NewRequestWithContext(s.ctx, http.MethodPost, s.serverURL+"/gerbil/get-all-relays", body)
+	if err != nil {
+		return fmt.Errorf("failed to create mappings request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := s.httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to fetch mappings: %v", err)
 	}
@@ -1102,7 +1158,13 @@ func (s *UDPProxyServer) notifyServer(endpoint ClientEndpoint) {
 		return
 	}
 
-	resp, err := http.Post(s.serverURL+"/gerbil/update-hole-punch", "application/json", bytes.NewBuffer(jsonData))
+	req, err := http.NewRequestWithContext(s.ctx, http.MethodPost, s.serverURL+"/gerbil/update-hole-punch", bytes.NewBuffer(jsonData))
+	if err != nil {
+		logger.Error("Failed to create server notification: %v", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := s.httpClient.Do(req)
 	if err != nil {
 		logger.Error("Failed to notify server: %v", err)
 		return

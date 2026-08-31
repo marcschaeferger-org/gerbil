@@ -63,7 +63,8 @@ See [docs/observability.md](docs/observability.md) for complete documentation, m
 Important:
 - `reachableAt`: How should the remote server reach Gerbil's API?
 - `generateAndSaveKeyTo`: Where to save the generated WireGuard private key to persist across restarts.
-- `remoteConfig`: Remote config location to HTTP get the JSON based config from.
+- `remoteConfig`: HTTPS endpoint used to retrieve the JSON configuration.
+- `allow-insecure-remote-config` (optional): Allow plaintext HTTP remote config for development only. Default: `false`
 
 Others:
 - `reportBandwidthTo` (optional): **DEPRECATED** - Use `remoteConfig` instead. Remote HTTP endpoint to send peer bandwidth data
@@ -84,6 +85,7 @@ All CLI arguments can also be provided via environment variables:
 
 - `INTERFACE`: Name of the WireGuard interface
 - `REMOTE_CONFIG`: URL of the remote config server
+- `ALLOW_INSECURE_REMOTE_CONFIG`: Allow plaintext HTTP remote config for development only (`true`/`false`)
 - `LISTEN`: Address to listen on for HTTP server
 - `GENERATE_AND_SAVE_KEY_TO`: Path to save generated private key
 - `REACHABLE_AT`: Endpoint of the HTTP server to tell remote config about
@@ -102,7 +104,7 @@ Example:
 ./gerbil \
 --reachableAt=http://gerbil:3004 \
 --generateAndSaveKeyTo=/var/config/key \
---remoteConfig=http://pangolin:3001/api/v1/
+--remoteConfig=https://pangolin:3001/api/v1/
 ```
 
 ```yaml
@@ -114,7 +116,7 @@ services:
     command:
       - --reachableAt=http://gerbil:3004
       - --generateAndSaveKeyTo=/var/config/key
-      - --remoteConfig=http://pangolin:3001/api/v1/
+      - --remoteConfig=https://pangolin:3001/api/v1/
     volumes:
       - ./config/:/var/config
     cap_add:
