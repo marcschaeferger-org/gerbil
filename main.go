@@ -13,7 +13,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
-	_ "net/http/pprof"
 	"os"
 	"os/exec"
 	"os/signal"
