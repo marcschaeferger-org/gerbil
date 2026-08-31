@@ -918,8 +918,8 @@ func main() {
 	// Note: metricsPath is registered directly without httpMetricsMiddleware to prevent infinite recursion.
 	// The metricsHandler must not be wrapped by the middleware, as it would observe its own observation calls.
 	if metricsHandler != nil {
-		http.Handle(metricsPath, metricsHandler)
-		logger.Info("Metrics endpoint enabled at %s", metricsPath)
+		http.Handle(metricsPath, requireControlAuth(metricsHandler))
+		logger.Info("Authenticated metrics endpoint enabled at %s", metricsPath)
 	}
 
 	listener, err := net.Listen("tcp", listenAddr)

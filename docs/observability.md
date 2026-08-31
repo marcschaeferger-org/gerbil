@@ -152,7 +152,11 @@ in the WireGuard config file.
 
 The Prometheus `/metrics` endpoint is registered only when
 `--metrics-backend=prometheus`. All gerbil_* metrics plus Go runtime metrics
-are available.
+are available. Scrapers must authenticate with the `CONTROL_API_TOKEN` value:
+
+```text
+Authorization: Bearer <token>
+```
 
 ---
 

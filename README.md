@@ -90,7 +90,7 @@ All CLI arguments can also be provided via environment variables:
 - `SNI_PROXY_ALLOWED_CIDRS`: Comma-separated CIDRs allowed as remote SNI proxy targets
 - `GERBIL_SNI_TUNNEL_IDLE_TIMEOUT`: Maximum time an established SNI tunnel may remain idle. Default: `5m`
 - `LISTEN`: Address to listen on for the HTTP server (private/loopback addresses only; wildcard and public addresses are rejected; default `127.0.0.1:3003`)
-- `CONTROL_API_TOKEN`: ****** for control-plane mutation endpoints (required; at least 32 characters)
+- `CONTROL_API_TOKEN`: Bearer token for protected control-plane and metrics endpoints (required; at least 32 characters)
 - `GENERATE_AND_SAVE_KEY_TO`: Path to save generated private key
 - `REACHABLE_AT`: Endpoint of the HTTP server to tell remote config about
 - `LOG_LEVEL`: Log level (DEBUG, INFO, WARN, ERROR, FATAL)
@@ -104,7 +104,7 @@ All CLI arguments can also be provided via environment variables:
 
 Example:
 
-Set `CONTROL_API_TOKEN` to a shared random secret and `LISTEN` to the Gerbil host's private interface before starting the service. Callers must send the token as `Authorization: Bearer <token>` on control-plane mutation requests.
+Set `CONTROL_API_TOKEN` to a shared random secret and `LISTEN` to the Gerbil host's private interface before starting the service. Callers, including Prometheus scrapers, must send the token as `Authorization: Bearer <token>` on protected endpoints.
 
 ```bash
 ./gerbil \
