@@ -131,6 +131,10 @@ const pangolinDestHeader = "p-dest-header"
 // as before.
 const pangolinHostHeader = "p-dest-host-header"
 
+// maxRouterRequestBodyBytes bounds proxied AI API requests while allowing
+// payloads such as base64-encoded images.
+const maxRouterRequestBodyBytes int64 = 32 << 20 // 32 MiB
+
 // splitDestHeader separates an optional "scheme://" prefix from a
 // pangolinDestHeader value, defaulting to "http" when none is present.
 func splitDestHeader(dest string) (scheme, host string) {
@@ -389,6 +393,7 @@ func logDebugRequest(label string, req *http.Request) {
 	logger.Debug("%s: %s %s://%s%s headers:%s\nbody: %s", label, req.Method, req.URL.Scheme, req.Host, req.URL.RequestURI(), headerLines.String(), body)
 }
 
+
 // routerProxy forwards /router/* requests from the Pangolin AI gateway to a
 // destination on the WireGuard network, as named by pangolinDestHeader.
 // Used for proxying AI chat completion requests (incl. streaming) to
@@ -414,8 +419,7 @@ var routerProxy = &httputil.ReverseProxy{
 		pr.Out.Header.Del(pangolinDestHeader)
 		pr.Out.Header.Del(pangolinHostHeader)
 
-		logger.Debug("Router proxy: %s %s -> %s (Host: %s)", pr.In.Method, pr.In.URL.Path, pr.Out.URL.String(), pr.Out.Host)
-		logDebugRequest("Router outbound request", pr.Out)
+		logger.Debug("Router proxy: %s %s -> %s://%s%s (Host: %s)", pr.In.Method, pr.In.URL.Path, pr.Out.URL.Scheme, pr.Out.URL.Host, pr.Out.URL.EscapedPath(), pr.Out.Host)
 	},
 	Transport: routerTransport,
 	// Flush written bytes to the client immediately rather than buffering,
@@ -439,6 +443,13 @@ func handleRouter(w http.ResponseWriter, r *http.Request) {
 	if err := validateRouterDestination(dest); err != nil {
 		http.Error(w, "Invalid destination", http.StatusBadRequest)
 		return
+	}
+	if r.ContentLength > maxRouterRequestBodyBytes {
+		http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	if r.Body != nil {
+		r.Body = http.MaxBytesReader(w, r.Body, maxRouterRequestBodyBytes)
 	}
 
 	routerProxy.ServeHTTP(w, r)
