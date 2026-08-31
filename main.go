@@ -346,14 +346,29 @@ var routerTransport = &http.Transport{
 	},
 }
 
+// isSensitiveHeader reports whether a header commonly carries secrets and
+// should be redacted in logs.
+func isSensitiveHeader(name string) bool {
+	n := strings.ToLower(strings.TrimSpace(name))
+	switch n {
+	case "authorization", "proxy-authorization", "cookie", "set-cookie",
+		"x-api-key", "x-auth-token", "x-access-token":
+		return true
+	default:
+		return strings.Contains(n, "token") || strings.Contains(n, "secret") || strings.Contains(n, "password")
+	}
+}
+
 // logDebugRequest dumps a request's destination, headers, and body at debug
-// level for troubleshooting (e.g. verifying an auth header made it through
-// the proxy chain intact). It reads and restores req.Body so the request can
-// still be sent afterward. Header values (including secrets like API keys)
-// are logged as-is - only intended to be enabled for local troubleshooting.
+// level for troubleshooting. It reads and restores req.Body so the request can
+// still be sent afterward. Sensitive header values are redacted.
 func logDebugRequest(label string, req *http.Request) {
 	var headerLines strings.Builder
 	for name, values := range req.Header {
+		if isSensitiveHeader(name) {
+			fmt.Fprintf(&headerLines, "\n  %s: [REDACTED]", name)
+			continue
+		}
 		for _, v := range values {
 			fmt.Fprintf(&headerLines, "\n  %s: %s", name, v)
 		}
