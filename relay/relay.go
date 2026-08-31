@@ -219,6 +219,9 @@ func (c *endpointCache) Store(key string, entry cachedEndpointEntry) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	if c.maxEntries <= 0 {
+		return
+	}
 	if _, exists := c.entries[key]; !exists && len(c.entries) >= c.maxEntries {
 		for evictionKey := range c.entries {
 			delete(c.entries, evictionKey)

@@ -24,7 +24,7 @@ func TestEndpointCacheDeletesExpiredEntries(t *testing.T) {
 	cache := newEndpointCache(2, time.Second)
 	now := time.Now()
 	cache.Store("expired", cachedEndpointEntry{cachedAt: now.Add(-time.Second)})
-	cache.Store("fresh", cachedEndpointEntry{cachedAt: now})
+	cache.Store("fresh", cachedEndpointEntry{cachedAt: time.Now().Add(time.Hour)})
 
 	cache.DeleteExpired(now)
 
