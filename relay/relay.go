@@ -27,6 +27,24 @@ import (
 
 const relayIfname = "relay"
 
+// evictionSampleSize bounds per-eviction work when the UDP connection cap is hit.
+// We evict the oldest connection among a small sampled subset instead of scanning
+// the entire map on every eviction attempt.
+const evictionSampleSize = 64
+
+// Serializes UDP destination connection cap-check and creation to avoid
+// concurrent goroutines temporarily exceeding maxUDPConnections.
+var udpConnCreateMu sync.Mutex
+
+type packetBuffer [1500]byte
+
+func releasePacketBuffer(buf *packetBuffer) {
+	if buf == nil {
+		return
+	}
+	bufferPool.Put(buf)
+}
+
 const (
 	endpointCacheTTL        = 2500 * time.Millisecond
 	maxEndpointCacheEntries = 10000
@@ -153,6 +171,7 @@ type Packet struct {
 	data       []byte
 	remoteAddr *net.UDPAddr
 	n          int
+	buffer     *packetBuffer
 }
 
 // holePunchRateLimitEntry tracks hole punch message counts within a sliding 1-second window.
@@ -224,9 +243,18 @@ func (c *endpointCache) Store(key string, entry cachedEndpointEntry) {
 		return
 	}
 	if _, exists := c.entries[key]; !exists && len(c.entries) >= c.maxEntries {
-		for evictionKey := range c.entries {
-			delete(c.entries, evictionKey)
-			break
+		var oldestKey string
+		var oldestTime time.Time
+		first := true
+		for k, v := range c.entries {
+			if first || v.cachedAt.Before(oldestTime) {
+				oldestKey = k
+				oldestTime = v.cachedAt
+				first = false
+			}
+		}
+		if !first {
+			delete(c.entries, oldestKey)
 		}
 	}
 	c.entries[key] = entry
@@ -248,7 +276,7 @@ func (c *endpointCache) DeleteExpired(now time.Time) {
 // bufferPool allows reusing buffers to reduce allocations.
 var bufferPool = sync.Pool{
 	New: func() interface{} {
-		return make([]byte, 1500)
+		return new(packetBuffer)
 	},
 }
 
@@ -447,21 +475,21 @@ func (s *UDPProxyServer) readPackets() {
 			return
 		default:
 		}
-		buf := bufferPool.Get().([]byte)
-		n, remoteAddr, err := s.conn.ReadFromUDP(buf)
+		buf := bufferPool.Get().(*packetBuffer)
+		n, remoteAddr, err := s.conn.ReadFromUDP(buf[:])
 		if err != nil {
 			// If we're shutting down, exit
 			select {
 			case <-s.ctx.Done():
-				bufferPool.Put(buf[:1500])
+				releasePacketBuffer(buf)
 				return
 			default:
 				logger.Error("Error reading UDP packet: %v", err)
-				bufferPool.Put(buf[:1500])
+				releasePacketBuffer(buf)
 				continue
 			}
 		}
-		s.packetChan <- Packet{data: buf[:n], remoteAddr: remoteAddr, n: n}
+		s.packetChan <- Packet{data: buf[:n], remoteAddr: remoteAddr, n: n, buffer: buf}
 	}
 }
 
@@ -495,7 +523,7 @@ func (s *UDPProxyServer) packetWorker() {
 			if !allowed {
 				// logger.Debug("Rate limiting hole punch message from %s", rateLimitKey)
 				metrics.RecordHolePunchEvent(relayIfname, "rate_limited")
-				bufferPool.Put(packet.data[:1500])
+				releasePacketBuffer(packet.buffer)
 				continue
 			}
 
@@ -505,7 +533,7 @@ func (s *UDPProxyServer) packetWorker() {
 				logger.Error("Error unmarshaling encrypted message: %v", err)
 				metrics.RecordHolePunchEvent(relayIfname, "error")
 				// Return the buffer to the pool for reuse and continue with next packet
-				bufferPool.Put(packet.data[:1500])
+				releasePacketBuffer(packet.buffer)
 				continue
 			}
 
@@ -513,7 +541,7 @@ func (s *UDPProxyServer) packetWorker() {
 				logger.Error("Received malformed message without ephemeral key")
 				metrics.RecordHolePunchEvent(relayIfname, "error")
 				// Return the buffer to the pool for reuse and continue with next packet
-				bufferPool.Put(packet.data[:1500])
+				releasePacketBuffer(packet.buffer)
 				continue
 			}
 
@@ -523,7 +551,7 @@ func (s *UDPProxyServer) packetWorker() {
 				// logger.Error("Failed to decrypt message: %v", err)
 				metrics.RecordHolePunchEvent(relayIfname, "error")
 				// Return the buffer to the pool for reuse and continue with next packet
-				bufferPool.Put(packet.data[:1500])
+				releasePacketBuffer(packet.buffer)
 				continue
 			}
 
@@ -533,7 +561,7 @@ func (s *UDPProxyServer) packetWorker() {
 				logger.Error("Error unmarshaling decrypted message: %v", err)
 				metrics.RecordHolePunchEvent(relayIfname, "error")
 				// Return the buffer to the pool for reuse and continue with next packet
-				bufferPool.Put(packet.data[:1500])
+				releasePacketBuffer(packet.buffer)
 				continue
 			}
 
@@ -569,7 +597,7 @@ func (s *UDPProxyServer) packetWorker() {
 					metrics.RecordHolePunchEvent(relayIfname, "deduplicated")
 					s.clearSessionsForIP(endpoint.IP)
 					metrics.RecordHolePunchEvent(relayIfname, "success")
-					bufferPool.Put(packet.data[:1500])
+					releasePacketBuffer(packet.buffer)
 					continue
 				}
 			}
@@ -586,7 +614,7 @@ func (s *UDPProxyServer) packetWorker() {
 			metrics.RecordHolePunchEvent(relayIfname, "success")
 		}
 		// Return the buffer to the pool for reuse.
-		bufferPool.Put(packet.data[:1500])
+		releasePacketBuffer(packet.buffer)
 	}
 }
 
@@ -1005,6 +1033,17 @@ func (s *UDPProxyServer) getOrCreateConnection(destAddr *net.UDPAddr, remoteAddr
 		return destConn.conn, nil
 	}
 
+	// Serialize cap-check + create + store to enforce maxUDPConnections under concurrency.
+	udpConnCreateMu.Lock()
+	defer udpConnCreateMu.Unlock()
+
+	// Another goroutine may have created the connection while we were waiting.
+	if conn, ok := s.connections.Load(key); ok {
+		destConn := conn.(*DestinationConn)
+		destConn.lastUsed.Store(time.Now().UnixNano())
+		return destConn.conn, nil
+	}
+
 	// Enforce a hard cap on concurrent sockets so a burst of peer churn can't
 	// exhaust the host's ephemeral ports/fds. Evict the least-recently-used
 	// connection to make room instead of growing unbounded.
@@ -1037,28 +1076,48 @@ func (s *UDPProxyServer) getOrCreateConnection(destAddr *net.UDPAddr, remoteAddr
 	return newConn, nil
 }
 
-// evictLRUConnection closes and removes the least-recently-used destination
-// connection so a new one can be created under the concurrent connection cap.
+// removeConnection removes target only if it is still the value stored for key.
+// Serializing with connection creation prevents stale cleanup work from deleting
+// a replacement connection or decrementing connectionCount for the wrong entry.
+func (s *UDPProxyServer) removeConnection(key string, target *DestinationConn) bool {
+	udpConnCreateMu.Lock()
+	defer udpConnCreateMu.Unlock()
+	return s.removeConnectionLocked(key, target)
+}
+
+// removeConnectionLocked requires udpConnCreateMu to be held by the caller.
+func (s *UDPProxyServer) removeConnectionLocked(key string, target *DestinationConn) bool {
+	if !s.connections.CompareAndDelete(key, target) {
+		return false
+	}
+	target.conn.Close()
+	s.connectionCount.Add(-1)
+	return true
+}
+
+// evictLRUConnection closes and removes an old destination connection so a new
+// one can be created under the concurrent connection cap.
+// To keep this path fast under churn, we only sample a fixed number of entries
+// and evict the oldest within that sample.
 func (s *UDPProxyServer) evictLRUConnection() {
-	var oldestKey interface{}
+	var oldestKey string
 	var oldestConn *DestinationConn
 	var oldestTime int64
+	sampled := 0
 
 	s.connections.Range(func(key, value interface{}) bool {
 		destConn := value.(*DestinationConn)
 		lu := destConn.lastUsed.Load()
-		if oldestKey == nil || lu < oldestTime {
-			oldestKey = key
+		if oldestConn == nil || lu < oldestTime {
+			oldestKey = key.(string)
 			oldestConn = destConn
 			oldestTime = lu
 		}
-		return true
+		sampled++
+		return sampled < evictionSampleSize
 	})
 
-	if oldestKey != nil {
-		s.connections.Delete(oldestKey)
-		oldestConn.conn.Close()
-		s.connectionCount.Add(-1)
+	if oldestConn != nil && s.removeConnectionLocked(oldestKey, oldestConn) {
 		metrics.RecordUDPConnection(relayIfname, -1)
 		metrics.RecordProxyCleanupRemoved(relayIfname, "conn_evicted", 1)
 	}
@@ -1129,9 +1188,8 @@ func (s *UDPProxyServer) cleanupIdleConnections() {
 			removed := int64(0)
 			s.connections.Range(func(key, value interface{}) bool {
 				destConn := value.(*DestinationConn)
-				if now-destConn.lastUsed.Load() > int64(5*time.Minute) {
-					destConn.conn.Close()
-					s.connections.Delete(key)
+				if now-destConn.lastUsed.Load() > int64(5*time.Minute) &&
+					s.removeConnection(key.(string), destConn) {
 					removed++
 				}
 				return true
@@ -1303,7 +1361,7 @@ func (s *UDPProxyServer) OnPeerRemoved(wgIP string) {
 
 // clearConnectionsForWGIP removes all connections associated with a specific WireGuard IP
 func (s *UDPProxyServer) clearConnectionsForWGIP(wgIP string) {
-	var keysToDelete []string
+	removed := int64(0)
 
 	s.connections.Range(func(key, value interface{}) bool {
 		keyStr := key.(string)
@@ -1311,24 +1369,18 @@ func (s *UDPProxyServer) clearConnectionsForWGIP(wgIP string) {
 
 		// Connection keys are in format "destAddr-remoteAddr"
 		// Check if either destination or remote address contains the WG IP
-		if containsIP(keyStr, wgIP) {
-			keysToDelete = append(keysToDelete, keyStr)
-			destConn.conn.Close()
+		if containsIP(keyStr, wgIP) && s.removeConnection(keyStr, destConn) {
+			removed++
 			logger.Debug("Closing connection for WG IP %s: %s", wgIP, keyStr)
 		}
 		return true
 	})
 
-	// Delete the connections
-	for _, key := range keysToDelete {
-		s.connections.Delete(key)
-	}
-	if len(keysToDelete) > 0 {
-		s.connectionCount.Add(-int64(len(keysToDelete)))
-		metrics.RecordUDPConnection(relayIfname, -int64(len(keysToDelete)))
+	if removed > 0 {
+		metrics.RecordUDPConnection(relayIfname, -removed)
 	}
 
-	logger.Info("Cleared %d connections for WG IP: %s", len(keysToDelete), wgIP)
+	logger.Info("Cleared %d connections for WG IP: %s", removed, wgIP)
 }
 
 // clearSessionsForWGIP removes all WireGuard sessions associated with a specific WireGuard IP

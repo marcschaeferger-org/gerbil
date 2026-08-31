@@ -103,6 +103,18 @@ func TestNewSNIProxyRequiresHTTPS(t *testing.T) {
 	}
 }
 
+func TestNewSNIProxyAcceptsHTTPSRemoteConfigURL(t *testing.T) {
+	if _, err := NewSNIProxy(8443, "https://pangolin.example.com", "", "127.0.0.1", 443, nil, false, nil); err != nil {
+		t.Fatalf("expected valid https remote config URL to be accepted: %v", err)
+	}
+}
+
+func TestNewSNIProxyAcceptsEmptyRemoteConfigURL(t *testing.T) {
+	if _, err := NewSNIProxy(8443, "", "", "127.0.0.1", 443, nil, false, nil); err != nil {
+		t.Fatalf("expected empty remote config URL to be accepted: %v", err)
+	}
+}
+
 func TestNewSNIProxyValidatesAllowedNetworks(t *testing.T) {
 	if _, err := NewSNIProxy(8443, "https://pangolin.example.com", "", "127.0.0.1", 443, nil, false, nil, "not-a-cidr"); err == nil {
 		t.Fatal("expected invalid allowed network to be rejected")
@@ -191,13 +203,13 @@ func TestBuildProxyProtocolHeader(t *testing.T) {
 			name:       "IPv4 client with IPv6 loopback target",
 			clientAddr: "192.168.1.100:12345",
 			targetAddr: "[::1]:443",
-			expected:   "PROXY TCP4 192.168.1.100 127.0.0.1 12345 443\r\n",
+			expected:   "PROXY TCP6 ::ffff:192.168.1.100 ::1 12345 443\r\n",
 		},
 		{
 			name:       "IPv4 client with IPv6 target",
 			clientAddr: "192.168.1.100:12345",
 			targetAddr: "[2001:db8::2]:443",
-			expected:   "PROXY TCP4 192.168.1.100 127.0.0.1 12345 443\r\n",
+			expected:   "PROXY TCP6 ::ffff:192.168.1.100 2001:db8::2 12345 443\r\n",
 		},
 		{
 			name:       "IPv6 client with IPv4 target",
@@ -276,6 +288,23 @@ func TestBuildProxyProtocolHeaderFromInfo(t *testing.T) {
 	header = proxy.buildProxyProtocolHeaderFromInfo(proxyInfo, targetAddr)
 
 	expected = "PROXY TCP6 2001:db8::1 ::1 12345 8080\r\n"
+	if header != expected {
+		t.Errorf("Expected header '%s', got '%s'", expected, header)
+	}
+
+	// Mixed-family endpoints preserve the IPv6 destination and map the IPv4 source.
+	proxyInfo = &ProxyProtocolInfo{
+		Protocol: "TCP4",
+		SrcIP:    "10.0.0.1",
+		DestIP:   "2001:db8::2",
+		SrcPort:  12345,
+		DestPort: 443,
+	}
+
+	targetAddr, _ = net.ResolveTCPAddr("tcp6", "[2001:db8::2]:8080")
+	header = proxy.buildProxyProtocolHeaderFromInfo(proxyInfo, targetAddr)
+
+	expected = "PROXY TCP6 ::ffff:10.0.0.1 2001:db8::2 12345 8080\r\n"
 	if header != expected {
 		t.Errorf("Expected header '%s', got '%s'", expected, header)
 	}

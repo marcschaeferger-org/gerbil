@@ -2,10 +2,54 @@ package relay
 
 import (
 	"context"
+	"net"
 	"net/http"
 	"testing"
 	"time"
 )
+
+func TestPacketBufferPoolUsesPointerOwnership(t *testing.T) {
+	buf, ok := bufferPool.Get().(*packetBuffer)
+	if !ok {
+		t.Fatalf("bufferPool.Get() returned an unexpected type")
+	}
+
+	packet := Packet{data: buf[:1], n: 1, buffer: buf}
+	if packet.buffer != buf {
+		t.Fatal("packet did not retain its pooled buffer")
+	}
+	releasePacketBuffer(packet.buffer)
+}
+
+func TestRemoveConnectionRejectsStaleTarget(t *testing.T) {
+	conn, err := net.ListenUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+
+	server := &UDPProxyServer{}
+	replacement := &DestinationConn{conn: conn}
+	server.connections.Store("connection", replacement)
+	server.connectionCount.Store(1)
+
+	if server.removeConnection("connection", &DestinationConn{}) {
+		t.Fatal("removed a connection that did not match the targeted entry")
+	}
+	if got := server.connectionCount.Load(); got != 1 {
+		t.Fatalf("connectionCount = %d after stale removal, want 1", got)
+	}
+	if got, ok := server.connections.Load("connection"); !ok || got != replacement {
+		t.Fatal("replacement connection was removed by stale cleanup")
+	}
+
+	if !server.removeConnection("connection", replacement) {
+		t.Fatal("failed to remove the targeted connection")
+	}
+	if got := server.connectionCount.Load(); got != 0 {
+		t.Fatalf("connectionCount = %d after removal, want 0", got)
+	}
+}
 
 func TestValidateRemoteConfigURL(t *testing.T) {
 	tests := []struct {
