@@ -586,26 +586,9 @@ func main() {
 	var key wgtypes.Key
 	// if generateAndSaveKeyTo is provided, generate a private key and save it to the file. if the file already exists, load the key from the file
 	if generateAndSaveKeyTo != "" {
-		if _, err := os.Stat(generateAndSaveKeyTo); os.IsNotExist(err) {
-			// generate a new private key
-			key, err = wgtypes.GeneratePrivateKey()
-			if err != nil {
-				logger.Fatal("Failed to generate private key: %v", err)
-			}
-			// save the key to the file
-			err = os.WriteFile(generateAndSaveKeyTo, []byte(key.String()), 0644)
-			if err != nil {
-				logger.Fatal("Failed to save private key: %v", err)
-			}
-		} else {
-			keyData, err := os.ReadFile(generateAndSaveKeyTo)
-			if err != nil {
-				logger.Fatal("Failed to read private key: %v", err)
-			}
-			key, err = wgtypes.ParseKey(string(keyData))
-			if err != nil {
-				logger.Fatal("Failed to parse private key: %v", err)
-			}
+		key, err = loadOrGeneratePrivateKey(generateAndSaveKeyTo)
+		if err != nil {
+			logger.Fatal("Failed to load or generate private key: %v", err)
 		}
 	} else {
 		// if no generateAndSaveKeyTo is provided, ensure that the private key is provided
@@ -765,6 +748,51 @@ func main() {
 	} else if errors.Is(err, context.Canceled) {
 		logger.Info("Context cancelled, shutting down")
 	}
+}
+
+func loadOrGeneratePrivateKey(path string) (wgtypes.Key, error) {
+	keyFile, err := os.Open(path)
+	if err == nil {
+		defer keyFile.Close()
+
+		fileInfo, err := keyFile.Stat()
+		if err != nil {
+			return wgtypes.Key{}, fmt.Errorf("failed to inspect private key file: %w", err)
+		}
+		if fileInfo.Mode().Perm()&0077 != 0 {
+			return wgtypes.Key{}, fmt.Errorf("private key file has insecure permissions %04o", fileInfo.Mode().Perm())
+		}
+
+		keyData, err := io.ReadAll(keyFile)
+		if err != nil {
+			return wgtypes.Key{}, fmt.Errorf("failed to read private key: %w", err)
+		}
+		key, err := wgtypes.ParseKey(string(keyData))
+		if err != nil {
+			return wgtypes.Key{}, fmt.Errorf("failed to parse private key: %w", err)
+		}
+		return key, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return wgtypes.Key{}, fmt.Errorf("failed to open private key file: %w", err)
+	}
+
+	key, err := wgtypes.GeneratePrivateKey()
+	if err != nil {
+		return wgtypes.Key{}, fmt.Errorf("failed to generate private key: %w", err)
+	}
+	keyFile, err = os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return wgtypes.Key{}, fmt.Errorf("failed to create private key file: %w", err)
+	}
+	if _, err := io.WriteString(keyFile, key.String()); err != nil {
+		keyFile.Close()
+		return wgtypes.Key{}, fmt.Errorf("failed to write private key: %w", err)
+	}
+	if err := keyFile.Close(); err != nil {
+		return wgtypes.Key{}, fmt.Errorf("failed to close private key file: %w", err)
+	}
+	return key, nil
 }
 
 func loadRemoteConfig(url string, key wgtypes.Key, reachableAt string) (WgConfig, error) {
