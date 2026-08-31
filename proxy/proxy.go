@@ -323,10 +323,11 @@ func (p *SNIProxy) buildProxyProtocolHeaderFromInfo(proxyInfo *ProxyProtocolInfo
 	}
 
 	protocol, targetIP = determineProxyProtocolAndTargetIP(srcIP, targetTCP.IP)
+	sourceIP := normalizeProxyProtocolIP(srcIP, protocol)
 
 	return fmt.Sprintf("PROXY %s %s %s %d %d\r\n",
 		protocol,
-		proxyInfo.SrcIP,
+		sourceIP,
 		targetIP,
 		proxyInfo.SrcPort,
 		targetTCP.Port)
@@ -336,14 +337,13 @@ func (p *SNIProxy) buildProxyProtocolHeaderFromInfo(proxyInfo *ProxyProtocolInfo
 func determineProxyProtocolAndTargetIP(clientIP, targetIP net.IP) (string, string) {
 	// Determine protocol family based on client IP and normalize target IP accordingly.
 	if clientIP.To4() != nil {
-		// Client is IPv4, use TCP4 protocol.
 		if targetIP.To4() != nil {
-			// Target is also IPv4, use as-is.
 			return "TCP4", targetIP.String()
 		}
 
-		// Target is IPv6; use IPv4 loopback as a safe fallback for TCP4 header consistency.
-		return "TCP4", "127.0.0.1"
+		// PROXY protocol requires both endpoints to match the declared family.
+		// Preserve the IPv6 target and represent the IPv4 client as IPv4-mapped IPv6.
+		return "TCP6", targetIP.String()
 	}
 
 	// Client is IPv6, use TCP6 protocol.
@@ -354,6 +354,13 @@ func determineProxyProtocolAndTargetIP(clientIP, targetIP net.IP) (string, strin
 
 	// Target is also IPv6, use as-is.
 	return "TCP6", targetIP.String()
+}
+
+func normalizeProxyProtocolIP(ip net.IP, protocol string) string {
+	if protocol == "TCP6" && ip.To4() != nil {
+		return "::ffff:" + ip.String()
+	}
+	return ip.String()
 }
 
 // buildProxyProtocolHeader creates a PROXY protocol v1 header
@@ -374,7 +381,7 @@ func buildProxyProtocolHeader(clientAddr, targetAddr net.Addr) string {
 
 	return fmt.Sprintf("PROXY %s %s %s %d %d\r\n",
 		protocol,
-		clientTCP.IP.String(),
+		normalizeProxyProtocolIP(clientTCP.IP, protocol),
 		normalizedTargetIP,
 		clientTCP.Port,
 		targetTCP.Port)
