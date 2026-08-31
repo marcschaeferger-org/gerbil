@@ -65,6 +65,19 @@ func loadMaxSNIConnectionsPerIP() int64 {
 	return defaultMaxSNIConnectionsPerIP
 }
 
+// defaultSNITunnelIdleTimeout limits how long an established tunnel can go
+// without transferring data. Overridable via GERBIL_SNI_TUNNEL_IDLE_TIMEOUT.
+const defaultSNITunnelIdleTimeout = 5 * time.Minute
+
+func loadSNITunnelIdleTimeout() time.Duration {
+	if v := os.Getenv("GERBIL_SNI_TUNNEL_IDLE_TIMEOUT"); v != "" {
+		if timeout, err := time.ParseDuration(v); err == nil && timeout > 0 {
+			return timeout
+		}
+	}
+	return defaultSNITunnelIdleTimeout
+}
+
 // RouteRecord represents a routing configuration
 type RouteRecord struct {
 	Hostname   string
@@ -90,18 +103,19 @@ type ProxyProtocolInfo struct {
 
 // SNIProxy represents the main proxy server
 type SNIProxy struct {
-	port            int
-	cache           *cache.Cache
-	listener        net.Listener
-	ctx             context.Context
-	cancel          context.CancelFunc
-	wg              sync.WaitGroup
-	localProxyAddr  string
-	localProxyPort  int
-	remoteConfigURL string
-	publicKey       string
-	proxyProtocol   bool // Enable PROXY protocol v1
-	allowedNetworks []netip.Prefix
+	port              int
+	cache             *cache.Cache
+	listener          net.Listener
+	ctx               context.Context
+	cancel            context.CancelFunc
+	wg                sync.WaitGroup
+	localProxyAddr    string
+	localProxyPort    int
+	remoteConfigURL   string
+	publicKey         string
+	proxyProtocol     bool // Enable PROXY protocol v1
+	allowedNetworks   []netip.Prefix
+	tunnelIdleTimeout time.Duration
 
 	// New fields for fast local SNI lookup
 	localSNIs     map[string]struct{}
@@ -440,20 +454,21 @@ func NewSNIProxy(port int, remoteConfigURL, publicKey, localProxyAddr string, lo
 	}
 
 	proxy := &SNIProxy{
-		port:             port,
-		cache:            cache.New(3*time.Second, 10*time.Minute),
-		ctx:              ctx,
-		cancel:           cancel,
-		localProxyAddr:   localProxyAddr,
-		localProxyPort:   localProxyPort,
-		remoteConfigURL:  remoteConfigURL,
-		publicKey:        publicKey,
-		proxyProtocol:    proxyProtocol,
-		allowedNetworks:  parsedNetworks,
-		localSNIs:        make(map[string]struct{}),
-		localOverrides:   overridesMap,
-		activeTunnels:    make(map[string]*activeTunnel),
-		trustedUpstreams: trustedMap,
+		port:              port,
+		cache:             cache.New(3*time.Second, 10*time.Minute),
+		ctx:               ctx,
+		cancel:            cancel,
+		localProxyAddr:    localProxyAddr,
+		localProxyPort:    localProxyPort,
+		remoteConfigURL:   remoteConfigURL,
+		publicKey:         publicKey,
+		proxyProtocol:     proxyProtocol,
+		allowedNetworks:   parsedNetworks,
+		tunnelIdleTimeout: loadSNITunnelIdleTimeout(),
+		localSNIs:         make(map[string]struct{}),
+		localOverrides:    overridesMap,
+		activeTunnels:     make(map[string]*activeTunnel),
+		trustedUpstreams:  trustedMap,
 		httpClient: &http.Client{
 			Timeout: 5 * time.Second,
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -986,6 +1001,40 @@ type bufferedWriter struct {
 	io.Writer
 }
 
+type tunnelIdleDeadline struct {
+	mu      sync.Mutex
+	timeout time.Duration
+	conns   [2]net.Conn
+}
+
+func (d *tunnelIdleDeadline) refresh() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	deadline := time.Now().Add(d.timeout)
+	for _, conn := range d.conns {
+		if err := conn.SetDeadline(deadline); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type idleDeadlineReader struct {
+	reader  io.Reader
+	refresh func() error
+}
+
+func (r idleDeadlineReader) Read(buf []byte) (int, error) {
+	n, err := r.reader.Read(buf)
+	if n > 0 && err == nil {
+		if refreshErr := r.refresh(); refreshErr != nil {
+			return n, refreshErr
+		}
+	}
+	return n, err
+}
+
 // pipe handles bidirectional data transfer between connections
 func (p *SNIProxy) pipe(hostname string, clientConn, targetConn net.Conn, clientReader io.Reader) {
 	var wg sync.WaitGroup
@@ -1001,6 +1050,16 @@ func (p *SNIProxy) pipe(hostname string, clientConn, targetConn net.Conn, client
 		})
 	}
 
+	idleDeadline := &tunnelIdleDeadline{
+		timeout: p.tunnelIdleTimeout,
+		conns:   [2]net.Conn{clientConn, targetConn},
+	}
+	if err := idleDeadline.refresh(); err != nil {
+		logger.Debug("Failed to set tunnel idle deadline: %v", err)
+		closeConns()
+		return
+	}
+
 	// Copy data from client to target (using the buffered reader)
 	go func() {
 		defer wg.Done()
@@ -1014,7 +1073,8 @@ func (p *SNIProxy) pipe(hostname string, clientConn, targetConn net.Conn, client
 			p.bufferPool.Put(bufPtr)
 		}()
 
-		bytesCopied, err := io.CopyBuffer(bufferedWriter{targetConn}, bufferedReader{clientReader}, *bufPtr)
+		reader := idleDeadlineReader{reader: clientReader, refresh: idleDeadline.refresh}
+		bytesCopied, err := io.CopyBuffer(bufferedWriter{targetConn}, bufferedReader{reader}, *bufPtr)
 		metrics.RecordProxyBytesTransmitted("client_to_target", bytesCopied)
 		if err != nil && err != io.EOF {
 			logger.Debug("Copy client->target error: %v", err)
@@ -1034,7 +1094,8 @@ func (p *SNIProxy) pipe(hostname string, clientConn, targetConn net.Conn, client
 			p.bufferPool.Put(bufPtr)
 		}()
 
-		bytesCopied, err := io.CopyBuffer(bufferedWriter{clientConn}, bufferedReader{targetConn}, *bufPtr)
+		reader := idleDeadlineReader{reader: targetConn, refresh: idleDeadline.refresh}
+		bytesCopied, err := io.CopyBuffer(bufferedWriter{clientConn}, bufferedReader{reader}, *bufPtr)
 		metrics.RecordProxyBytesTransmitted("target_to_client", bytesCopied)
 		if err != nil && err != io.EOF {
 			logger.Debug("Copy target->client error: %v", err)

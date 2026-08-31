@@ -88,6 +88,7 @@ All CLI arguments can also be provided via environment variables:
 - `REMOTE_CONFIG`: URL of the remote config server
 - `REMOTE_CONFIG_SIGNING_KEY`: Base64-encoded Ed25519 public key used to verify the signature in the `X-Gerbil-Config-Signature` response header. The signature must cover the exact response body.
 - `SNI_PROXY_ALLOWED_CIDRS`: Comma-separated CIDRs allowed as remote SNI proxy targets
+- `GERBIL_SNI_TUNNEL_IDLE_TIMEOUT`: Maximum time an established SNI tunnel may remain idle. Default: `5m`
 - `LISTEN`: Address to listen on for the HTTP server (private/loopback addresses only; wildcard and public addresses are rejected; default `127.0.0.1:3003`)
 - `CONTROL_API_TOKEN`: ****** for control-plane mutation endpoints (required; at least 32 characters)
 - `GENERATE_AND_SAVE_KEY_TO`: Path to save generated private key

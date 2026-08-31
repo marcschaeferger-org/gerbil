@@ -1,10 +1,101 @@
 package proxy
 
 import (
+	"io"
 	"net"
 	"net/http"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/fosrl/gerbil/logger"
 )
+
+func TestLoadSNITunnelIdleTimeout(t *testing.T) {
+	tests := []struct {
+		name     string
+		value    string
+		expected time.Duration
+	}{
+		{name: "configured", value: "30s", expected: 30 * time.Second},
+		{name: "invalid", value: "invalid", expected: defaultSNITunnelIdleTimeout},
+		{name: "non-positive", value: "0s", expected: defaultSNITunnelIdleTimeout},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("GERBIL_SNI_TUNNEL_IDLE_TIMEOUT", tt.value)
+			if got := loadSNITunnelIdleTimeout(); got != tt.expected {
+				t.Fatalf("loadSNITunnelIdleTimeout() = %v, want %v", got, tt.expected)
+			}
+		})
+	}
+}
+
+func TestPipeClosesIdleTunnel(t *testing.T) {
+	proxy := newPipeTestProxy(200 * time.Millisecond)
+	clientConn, clientPeer := net.Pipe()
+	targetConn, targetPeer := net.Pipe()
+	defer clientPeer.Close()
+	defer targetPeer.Close()
+
+	done := make(chan struct{})
+	go func() {
+		proxy.pipe("example.com", clientConn, targetConn, clientConn)
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("idle tunnel did not close after its deadline")
+	}
+}
+
+func TestPipeRefreshesIdleDeadlineAfterTraffic(t *testing.T) {
+	proxy := newPipeTestProxy(200 * time.Millisecond)
+	clientConn, clientPeer := net.Pipe()
+	targetConn, targetPeer := net.Pipe()
+	defer clientPeer.Close()
+	defer targetPeer.Close()
+
+	done := make(chan struct{})
+	go func() {
+		proxy.pipe("example.com", clientConn, targetConn, clientConn)
+		close(done)
+	}()
+
+	time.Sleep(120 * time.Millisecond)
+	go func() { _, _ = clientPeer.Write([]byte("x")) }()
+	if _, err := io.ReadFull(targetPeer, make([]byte, 1)); err != nil {
+		t.Fatalf("failed to forward tunnel traffic: %v", err)
+	}
+
+	select {
+	case <-done:
+		t.Fatal("tunnel closed using the original deadline after traffic")
+	case <-time.After(120 * time.Millisecond):
+	}
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("tunnel did not close after the refreshed deadline")
+	}
+}
+
+func newPipeTestProxy(idleTimeout time.Duration) *SNIProxy {
+	logger.Init()
+	return &SNIProxy{
+		tunnelIdleTimeout: idleTimeout,
+		bufferPool: &sync.Pool{
+			New: func() interface{} {
+				buf := make([]byte, 32*1024)
+				return &buf
+			},
+		},
+	}
+}
 
 func TestNewSNIProxyRequiresHTTPS(t *testing.T) {
 	if _, err := NewSNIProxy(8443, "http://pangolin.example.com", "", "127.0.0.1", 443, nil, false, nil); err == nil {
