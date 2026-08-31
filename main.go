@@ -52,6 +52,13 @@ var (
 	disableFirewall  bool
 )
 
+var remoteConfigHTTPClient = &http.Client{
+	Timeout: 5 * time.Second,
+	CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+		return fmt.Errorf("remote config redirects are not allowed")
+	},
+}
+
 type WgConfig struct {
 	PrivateKey string `json:"privateKey"`
 	ListenPort int    `json:"listenPort"`
@@ -315,6 +322,7 @@ func main() {
 		localProxyPort       int
 		localOverridesStr    string
 		trustedUpstreamsStr  string
+		proxyAllowedCIDRsStr string
 		proxyProtocol        bool
 
 		// Metrics configuration variables (set from env, then overridden by CLI flags)
@@ -343,6 +351,7 @@ func main() {
 	localProxyPortStr := os.Getenv("LOCAL_PROXY_PORT")
 	localOverridesStr = os.Getenv("LOCAL_OVERRIDES")
 	trustedUpstreamsStr = os.Getenv("TRUSTED_UPSTREAMS")
+	proxyAllowedCIDRsStr = os.Getenv("SNI_PROXY_ALLOWED_CIDRS")
 	proxyProtocolStr := os.Getenv("PROXY_PROTOCOL")
 	doTrafficShapingStr := os.Getenv("DO_TRAFFIC_SHAPING")
 	bandwidthLimitStr := os.Getenv("BANDWIDTH_LIMIT")
@@ -452,6 +461,9 @@ func main() {
 	if trustedUpstreamsStr == "" {
 		flag.StringVar(&trustedUpstreamsStr, "trusted-upstreams", "", "Comma-separated list of trusted upstream proxy domain names/IPs that can send PROXY protocol")
 	}
+	if proxyAllowedCIDRsStr == "" {
+		flag.StringVar(&proxyAllowedCIDRsStr, "sni-proxy-allowed-cidrs", "", "Comma-separated CIDRs allowed as remote SNI proxy targets")
+	}
 
 	if proxyProtocolStr != "" {
 		proxyProtocol = strings.ToLower(proxyProtocolStr) == "true"
@@ -492,6 +504,9 @@ func main() {
 	flag.DurationVar(&otelMetricsTimeout, "otel-metrics-timeout", otelMetricsTimeout, "Timeout for OTLP exporter setup")
 
 	flag.Parse()
+	if err := proxy.ValidateRemoteConfigURL(remoteConfigURL); err != nil {
+		log.Fatal(err)
+	}
 
 	// Heap profiles are dumped into the configured config directory (the same
 	// directory as the config file, or /var/config as a fallback for remote-config
@@ -703,7 +718,15 @@ func main() {
 		logger.Info("Trusted upstreams configured: %v", trustedUpstreams)
 	}
 
-	proxySNI, err = proxy.NewSNIProxy(sniProxyPort, remoteConfigURL, key.PublicKey().String(), localProxyAddr, localProxyPort, localOverrides, proxyProtocol, trustedUpstreams)
+	var proxyAllowedCIDRs []string
+	if proxyAllowedCIDRsStr != "" {
+		proxyAllowedCIDRs = strings.Split(proxyAllowedCIDRsStr, ",")
+		for i, network := range proxyAllowedCIDRs {
+			proxyAllowedCIDRs[i] = strings.TrimSpace(network)
+		}
+	}
+
+	proxySNI, err = proxy.NewSNIProxy(sniProxyPort, remoteConfigURL, key.PublicKey().String(), localProxyAddr, localProxyPort, localOverrides, proxyProtocol, trustedUpstreams, proxyAllowedCIDRs...)
 	if err != nil {
 		logger.Fatal("Failed to create proxy: %v", err)
 	}
@@ -774,7 +797,12 @@ func loadRemoteConfig(url string, key wgtypes.Key, reachableAt string) (WgConfig
 	} else {
 		body = bytes.NewBuffer([]byte(fmt.Sprintf(`{"publicKey": %q, "reachableAt": %q}`, key.PublicKey().String(), reachableAt)))
 	}
-	resp, err := http.Post(url, "application/json", body)
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, url, body)
+	if err != nil {
+		return WgConfig{}, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := remoteConfigHTTPClient.Do(req)
 	if err != nil {
 		// print the error
 		logger.Error("Error fetching remote config %s: %v", url, err)
