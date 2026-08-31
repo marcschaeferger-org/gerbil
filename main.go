@@ -535,6 +535,7 @@ func main() {
 	doTrafficShapingStr := os.Getenv("DO_TRAFFIC_SHAPING")
 	bandwidthLimitStr := os.Getenv("BANDWIDTH_LIMIT")
 	disableFirewallStr := os.Getenv("DISABLE_FIREWALL")
+	allowInsecureRemoteConfig := strings.EqualFold(os.Getenv("ALLOW_INSECURE_REMOTE_CONFIG"), "true")
 
 	// Read metrics env vars (defaults applied by DefaultMetricsConfig; these override defaults).
 	metricsEnabled = true // default
@@ -681,6 +682,7 @@ func main() {
 	flag.BoolVar(&otelMetricsInsecure, "otel-metrics-insecure", otelMetricsInsecure, "Disable TLS for OTLP connection")
 	flag.DurationVar(&otelMetricsExportInterval, "otel-metrics-export-interval", otelMetricsExportInterval, "Interval between OTLP metric pushes")
 	flag.DurationVar(&otelMetricsTimeout, "otel-metrics-timeout", otelMetricsTimeout, "Timeout for OTLP exporter setup")
+	flag.BoolVar(&allowInsecureRemoteConfig, "allow-insecure-remote-config", allowInsecureRemoteConfig, "Allow plaintext HTTP remote config for development only")
 
 	flag.Parse()
 	if err := proxy.ValidateRemoteConfigURL(remoteConfigURL); err != nil {
@@ -777,6 +779,12 @@ func main() {
 	// clean up the reomte config URL for backwards compatibility
 	remoteConfigURL = strings.TrimSuffix(remoteConfigURL, "/gerbil/get-config")
 	remoteConfigURL = strings.TrimSuffix(remoteConfigURL, "/")
+	if remoteConfigURL != "" {
+		if err := relay.ValidateRemoteConfigURL(remoteConfigURL, allowInsecureRemoteConfig); err != nil {
+			logger.Fatal("Invalid remote config URL: %v", err)
+		}
+	}
+	controlPlaneHTTPClient := relay.NewControlPlaneHTTPClient(allowInsecureRemoteConfig)
 
 	var key wgtypes.Key
 	// if generateAndSaveKeyTo is provided, generate a private key and save it to the file. if the file already exists, load the key from the file
@@ -809,8 +817,11 @@ func main() {
 		// loop until we get the config
 		for wgconfig.PrivateKey == "" {
 			logger.Info("Fetching remote config from %s", remoteConfigURL+"/gerbil/get-config")
-			wgconfig, err = loadRemoteConfig(remoteConfigURL+"/gerbil/get-config", key, reachableAt)
+			wgconfig, err = loadRemoteConfig(ctx, controlPlaneHTTPClient, remoteConfigURL+"/gerbil/get-config", key, reachableAt)
 			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
 				logger.Error("Failed to load configuration: %v", err)
 				time.Sleep(5 * time.Second)
 				continue
@@ -844,21 +855,28 @@ func main() {
 	group, groupCtx := errgroup.WithContext(ctx)
 
 	// Periodic bandwidth reporting
-	group.Go(func() error {
-		return periodicBandwidthCheck(groupCtx, remoteConfigURL+"/gerbil/receive-bandwidth")
-	})
+	if remoteConfigURL != "" {
+		group.Go(func() error {
+			return periodicBandwidthCheck(groupCtx, controlPlaneHTTPClient, remoteConfigURL+"/gerbil/receive-bandwidth")
+		})
+	}
 
 	// Start the UDP proxy server
 	relayPort := wgconfig.RelayPort
 	if relayPort == 0 {
 		relayPort = 21820 // in case there is no relay port set, use 21820
 	}
-	proxyRelay = relay.NewUDPProxyServer(groupCtx, fmt.Sprintf(":%d", relayPort), remoteConfigURL, key, reachableAt)
-	err = proxyRelay.Start()
-	if err != nil {
-		logger.Fatal("Failed to start UDP proxy server: %v", err)
+	if remoteConfigURL != "" {
+		proxyRelay, err = relay.NewUDPProxyServer(groupCtx, fmt.Sprintf(":%d", relayPort), remoteConfigURL, key, reachableAt, allowInsecureRemoteConfig)
+		if err != nil {
+			logger.Fatal("Failed to configure UDP proxy server: %v", err)
+		}
+		err = proxyRelay.Start()
+		if err != nil {
+			logger.Fatal("Failed to start UDP proxy server: %v", err)
+		}
+		defer proxyRelay.Stop()
 	}
-	defer proxyRelay.Stop()
 
 	// TODO: WE SHOULD PULL THIS OUT OF THE CONFIG OR SOMETHING
 	// 		 SO YOU DON'T NEED TO SET THIS SEPARATELY
@@ -1010,19 +1028,20 @@ func loadOrGeneratePrivateKey(path string) (wgtypes.Key, error) {
 	return key, nil
 }
 
-func loadRemoteConfig(url string, key wgtypes.Key, reachableAt string) (WgConfig, error) {
+func loadRemoteConfig(ctx context.Context, client *http.Client, url string, key wgtypes.Key, reachableAt string) (WgConfig, error) {
 	var body *bytes.Buffer
 	if reachableAt == "" {
 		body = bytes.NewBuffer([]byte(fmt.Sprintf(`{"publicKey": %q}`, key.PublicKey().String())))
 	} else {
 		body = bytes.NewBuffer([]byte(fmt.Sprintf(`{"publicKey": %q, "reachableAt": %q}`, key.PublicKey().String(), reachableAt)))
 	}
-	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, url, body)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, body)
 	if err != nil {
-		return WgConfig{}, err
+		metrics.RecordRemoteConfigFetch("error")
+		return WgConfig{}, fmt.Errorf("failed to create remote config request: %v", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
-	resp, err := remoteConfigHTTPClient.Do(req)
+	resp, err := client.Do(req)
 	if err != nil {
 		// print the error
 		logger.Error("Error fetching remote config %s: %v", url, err)
@@ -1845,14 +1864,14 @@ func handleUpdateLocalSNIs(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func periodicBandwidthCheck(ctx context.Context, endpoint string) error {
+func periodicBandwidthCheck(ctx context.Context, client *http.Client, endpoint string) error {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			if err := reportPeerBandwidth(endpoint); err != nil {
+			if err := reportPeerBandwidth(ctx, client, endpoint); err != nil {
 				logger.Info("Failed to report peer bandwidth: %v", err)
 			}
 		case <-ctx.Done():
@@ -1973,7 +1992,7 @@ func loadBandwidthReportBatchSize() int {
 	return defaultBandwidthReportBatchSize
 }
 
-func reportPeerBandwidth(apiURL string) error {
+func reportPeerBandwidth(ctx context.Context, client *http.Client, apiURL string) error {
 	bandwidths, err := calculatePeerBandwidth()
 	if err != nil {
 		// Record bandwidth report error
@@ -1992,7 +2011,7 @@ func reportPeerBandwidth(apiURL string) error {
 			end = len(bandwidths)
 		}
 
-		if err := sendPeerBandwidthBatch(apiURL, bandwidths[start:end]); err != nil {
+		if err := sendPeerBandwidthBatch(ctx, client, apiURL, bandwidths[start:end]); err != nil {
 			metrics.RecordBandwidthReport("error")
 			batchErrs = append(batchErrs, err)
 			continue
@@ -2006,13 +2025,18 @@ func reportPeerBandwidth(apiURL string) error {
 	return nil
 }
 
-func sendPeerBandwidthBatch(apiURL string, batch []PeerBandwidth) error {
+func sendPeerBandwidthBatch(ctx context.Context, client *http.Client, apiURL string, batch []PeerBandwidth) error {
 	jsonData, err := json.Marshal(batch)
 	if err != nil {
 		return fmt.Errorf("failed to marshal bandwidth data: %v", err)
 	}
 
-	resp, err := http.Post(apiURL, "application/json", bytes.NewBuffer(jsonData))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return fmt.Errorf("failed to create bandwidth request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to send bandwidth data: %v", err)
 	}
