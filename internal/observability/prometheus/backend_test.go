@@ -116,6 +116,30 @@ func TestPrometheusBackendMultipleLabels(t *testing.T) {
 	}
 }
 
+func TestPrometheusBackendBoundsHTTPMethodLabels(t *testing.T) {
+	b := newTestBackend(t)
+	c, err := b.NewCounter("bounded_methods_total", "Bounded HTTP methods", "method")
+	if err != nil {
+		t.Fatalf("NewCounter returned error: %v", err)
+	}
+	h, err := b.NewHistogram("bounded_method_duration_seconds", "Bounded HTTP method durations", []float64{1}, "method")
+	if err != nil {
+		t.Fatalf("NewHistogram returned error: %v", err)
+	}
+
+	for _, method := range []string{"CUSTOM-ONE", "CUSTOM-TWO"} {
+		c.Add(context.Background(), 1, map[string]string{"method": method})
+		h.Record(context.Background(), 0.5, map[string]string{"method": method})
+	}
+
+	body := scrapeMetrics(t, b)
+	assertMetricPresent(t, body, `bounded_methods_total{method="other"} 2`)
+	assertMetricPresent(t, body, `bounded_method_duration_seconds_count{method="other"} 2`)
+	if strings.Contains(body, "CUSTOM-ONE") || strings.Contains(body, "CUSTOM-TWO") {
+		t.Errorf("unexpected unbounded HTTP method label in metrics output\nbody:\n%s", body)
+	}
+}
+
 func TestPrometheusBackendGoMetrics(t *testing.T) {
 	b := newTestBackend(t)
 	body := scrapeMetrics(t, b)
