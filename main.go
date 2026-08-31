@@ -137,6 +137,163 @@ func hostname(hostport string) string {
 	return hostport
 }
 
+func validateRouterDestination(dest string) error {
+	scheme, hostport := splitDestHeader(dest)
+	if scheme != "http" && scheme != "https" {
+		return fmt.Errorf("unsupported destination scheme %q", scheme)
+	}
+
+	host, portString, err := net.SplitHostPort(hostport)
+	if err != nil || host == "" {
+		return errors.New("invalid destination address")
+	}
+	port, err := strconv.Atoi(portString)
+	if err != nil || port < 1 || port > 65535 {
+		return errors.New("invalid destination port")
+	}
+	return nil
+}
+
+func routerAllowedNetworks() ([]net.IPNet, error) {
+	wgMu.Lock()
+	defer wgMu.Unlock()
+
+	if wgClient == nil {
+		return nil, errors.New("WireGuard client is not initialized")
+	}
+	device, err := wgClient.Device(interfaceName)
+	if err != nil {
+		return nil, fmt.Errorf("read WireGuard peers: %w", err)
+	}
+
+	var networks []net.IPNet
+	for _, peer := range device.Peers {
+		networks = append(networks, peer.AllowedIPs...)
+	}
+	return networks, nil
+}
+
+type routerCIDRNode struct {
+	children       [2]*routerCIDRNode
+	networkIndexes []int
+}
+
+func routerCIDRCovered(node *routerCIDRNode) bool {
+	if node == nil {
+		return false
+	}
+	if len(node.networkIndexes) != 0 {
+		return true
+	}
+	return routerCIDRCovered(node.children[0]) && routerCIDRCovered(node.children[1])
+}
+
+func markRouterCIDRCover(node *routerCIDRNode, blocked map[int]struct{}) {
+	if len(node.networkIndexes) != 0 {
+		for _, index := range node.networkIndexes {
+			blocked[index] = struct{}{}
+		}
+		return
+	}
+	markRouterCIDRCover(node.children[0], blocked)
+	markRouterCIDRCover(node.children[1], blocked)
+}
+
+func unrestrictedRouterNetworks(networks []net.IPNet) map[int]struct{} {
+	blocked := make(map[int]struct{})
+	for {
+		roots := map[int]*routerCIDRNode{
+			net.IPv4len * 8: {},
+			net.IPv6len * 8: {},
+		}
+		for index, network := range networks {
+			if _, skip := blocked[index]; skip {
+				continue
+			}
+			ones, bits := network.Mask.Size()
+			ip := network.IP
+			if bits == net.IPv4len*8 {
+				ip = ip.To4()
+			} else if bits == net.IPv6len*8 {
+				ip = ip.To16()
+			} else {
+				continue
+			}
+
+			node := roots[bits]
+			for bit := 0; bit < ones; bit++ {
+				direction := (ip[bit/8] >> (7 - bit%8)) & 1
+				if node.children[direction] == nil {
+					node.children[direction] = &routerCIDRNode{}
+				}
+				node = node.children[direction]
+			}
+			node.networkIndexes = append(node.networkIndexes, index)
+		}
+
+		changed := false
+		for _, root := range roots {
+			if routerCIDRCovered(root) {
+				markRouterCIDRCover(root, blocked)
+				changed = true
+			}
+		}
+		if !changed {
+			return blocked
+		}
+	}
+}
+
+func routerIPAllowed(ip net.IP, networks []net.IPNet) bool {
+	if ip == nil || !ip.IsGlobalUnicast() {
+		return false
+	}
+	unrestricted := unrestrictedRouterNetworks(networks)
+	for index, network := range networks {
+		if _, blocked := unrestricted[index]; !blocked && network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// dialRouterContext resolves once, verifies every answer against the configured
+// WireGuard peer networks, and dials a verified numeric IP to prevent DNS
+// rebinding between validation and connection establishment.
+func dialRouterContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid router address: %w", err)
+	}
+	resolved, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, fmt.Errorf("resolve router destination: %w", err)
+	}
+	if len(resolved) == 0 {
+		return nil, errors.New("router destination resolved to no addresses")
+	}
+	allowedNetworks, err := routerAllowedNetworks()
+	if err != nil {
+		return nil, err
+	}
+	for _, candidate := range resolved {
+		if !routerIPAllowed(candidate.IP, allowedNetworks) {
+			return nil, fmt.Errorf("router destination resolved to disallowed address %s", candidate.IP)
+		}
+	}
+
+	dialer := &net.Dialer{}
+	var dialErrors []error
+	for _, candidate := range resolved {
+		conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(candidate.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+		dialErrors = append(dialErrors, err)
+	}
+	return nil, errors.Join(dialErrors...)
+}
+
 // routerSNIContextKey carries the TLS ServerName (SNI) that
 // routerTransport's DialTLSContext should present, since we dial the
 // WireGuard destination IP but the remote end typically terminates TLS
@@ -149,14 +306,22 @@ type routerSNIContextKey struct{}
 // (the WireGuard IP), which the destination's TLS termination won't have a
 // matching certificate/route for.
 var routerTransport = &http.Transport{
-	Proxy: http.ProxyFromEnvironment,
+	DialContext: dialRouterContext,
 	DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 		serverName := hostname(addr)
 		if sni, ok := ctx.Value(routerSNIContextKey{}).(string); ok && sni != "" {
 			serverName = sni
 		}
-		dialer := &tls.Dialer{Config: &tls.Config{ServerName: serverName}}
-		return dialer.DialContext(ctx, network, addr)
+		conn, err := dialRouterContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		tlsConn := tls.Client(conn, &tls.Config{ServerName: serverName})
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		return tlsConn, nil
 	},
 }
 
@@ -235,8 +400,7 @@ func handleRouter(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("Missing %s header", pangolinDestHeader), http.StatusBadRequest)
 		return
 	}
-	_, host := splitDestHeader(dest)
-	if _, _, err := net.SplitHostPort(host); err != nil {
+	if err := validateRouterDestination(dest); err != nil {
 		http.Error(w, "Invalid destination", http.StatusBadRequest)
 		return
 	}
