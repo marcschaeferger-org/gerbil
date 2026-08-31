@@ -786,7 +786,9 @@ func loadOrGeneratePrivateKey(path string) (wgtypes.Key, error) {
 		return wgtypes.Key{}, fmt.Errorf("failed to create private key file: %w", err)
 	}
 	if _, err := io.WriteString(keyFile, key.String()); err != nil {
-		keyFile.Close()
+		if closeErr := keyFile.Close(); closeErr != nil {
+			return wgtypes.Key{}, fmt.Errorf("failed to write private key: %v; additionally failed to close private key file: %w", err, closeErr)
+		}
 		return wgtypes.Key{}, fmt.Errorf("failed to write private key: %w", err)
 	}
 	if err := keyFile.Close(); err != nil {
