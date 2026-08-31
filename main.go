@@ -282,7 +282,17 @@ func dialRouterContext(ctx context.Context, network, addr string) (net.Conn, err
 		}
 	}
 
-	dialer := &net.Dialer{}
+dialer := &net.Dialer{
+		Control: func(_, _ string, conn syscall.RawConn) error {
+			var socketErr error
+			if err := conn.Control(func(fd uintptr) {
+				socketErr = syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, interfaceName)
+			}); err != nil {
+				return err
+			}
+			return socketErr
+		},
+	}
 	var dialErrors []error
 	for _, candidate := range resolved {
 		conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(candidate.String(), port))
