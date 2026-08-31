@@ -84,7 +84,7 @@ All CLI arguments can also be provided via environment variables:
 
 - `INTERFACE`: Name of the WireGuard interface
 - `REMOTE_CONFIG`: URL of the remote config server
-- `LISTEN`: Address to listen on for HTTP server
+- `LISTEN`: Address to listen on for the HTTP server (private/loopback addresses only; wildcard and public addresses are rejected; default `127.0.0.1:3003`)
 - `CONTROL_API_TOKEN`: Bearer token for control-plane mutation endpoints (required; at least 32 characters)
 - `GENERATE_AND_SAVE_KEY_TO`: Path to save generated private key
 - `REACHABLE_AT`: Endpoint of the HTTP server to tell remote config about

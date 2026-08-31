@@ -558,7 +558,7 @@ func main() {
 		advertisedURL, parseErr := url.Parse(reachableAt)
 		if parseErr != nil || (advertisedURL.Scheme != "http" && advertisedURL.Scheme != "https") ||
 			advertisedURL.Hostname() == "" || advertisedURL.Port() == "" {
-			logger.Fatal("REACHABLE_AT must be an HTTP(S) URL with an explicit port, or LISTEN must be set")
+			logger.Fatal("--reachableAt / REACHABLE_AT must be an HTTP(S) URL with an explicit port, or --listen / LISTEN must be set")
 		}
 		listenAddr = net.JoinHostPort(advertisedURL.Hostname(), advertisedURL.Port())
 	}
@@ -1238,10 +1238,14 @@ func handlePeer(w http.ResponseWriter, r *http.Request) {
 }
 
 func requireControlAuth(next http.Handler) http.Handler {
+	controlTokenHash := sha256.Sum256([]byte(controlAPIToken))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		scheme, token, ok := strings.Cut(r.Header.Get("Authorization"), " ")
+		const maxTokenLen = 1024
+		if len(token) > maxTokenLen {
+			token = token[:maxTokenLen]
+		}
 		providedTokenHash := sha256.Sum256([]byte(token))
-		controlTokenHash := sha256.Sum256([]byte(controlAPIToken))
 		if !ok || !strings.EqualFold(scheme, "Bearer") || token == "" ||
 			subtle.ConstantTimeCompare(providedTokenHash[:], controlTokenHash[:]) != 1 {
 			w.Header().Set("WWW-Authenticate", "Bearer")
