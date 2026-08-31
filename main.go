@@ -1037,7 +1037,7 @@ func loadOrGeneratePrivateKey(path string) (wgtypes.Key, error) {
 
 func parseRemoteConfigSigningKey(encoded string) (ed25519.PublicKey, error) {
 	if encoded == "" {
-		return nil, fmt.Errorf("REMOTE_CONFIG_SIGNING_KEY is required with REMOTE_CONFIG")
+		return nil, fmt.Errorf("REMOTE_CONFIG_SIGNING_KEY (or --remote-config-signing-key) is required with REMOTE_CONFIG")
 	}
 	key, err := base64.StdEncoding.DecodeString(encoded)
 	if err != nil {
@@ -1048,6 +1048,8 @@ func parseRemoteConfigSigningKey(encoded string) (ed25519.PublicKey, error) {
 	}
 	return ed25519.PublicKey(key), nil
 }
+
+const remoteConfigMaxBodyBytes = 1 << 20 // 1 MiB
 
 func loadRemoteConfig(ctx context.Context, client *http.Client, url string, key wgtypes.Key, reachableAt string, signingKey ed25519.PublicKey) (WgConfig, error) {
 	if err := relay.ValidateRemoteConfigURL(url); err != nil {
@@ -1060,7 +1062,9 @@ func loadRemoteConfig(ctx context.Context, client *http.Client, url string, key 
 	} else {
 		body = bytes.NewBuffer([]byte(fmt.Sprintf(`{"publicKey": %q, "reachableAt": %q}`, key.PublicKey().String(), reachableAt)))
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, body)
+	reqCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, url, body)
 	if err != nil {
 		metrics.RecordRemoteConfigFetch("error")
 		return WgConfig{}, fmt.Errorf("failed to create remote config request: %v", err)
@@ -1076,10 +1080,19 @@ func loadRemoteConfig(ctx context.Context, client *http.Client, url string, key 
 	}
 	defer resp.Body.Close()
 
-	data, err := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		metrics.RecordRemoteConfigFetch("error")
+		return WgConfig{}, fmt.Errorf("remote config request failed with status %d", resp.StatusCode)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(resp.Body, remoteConfigMaxBodyBytes+1))
 	if err != nil {
 		metrics.RecordRemoteConfigFetch("error")
 		return WgConfig{}, err
+	}
+	if int64(len(data)) > remoteConfigMaxBodyBytes {
+		metrics.RecordRemoteConfigFetch("error")
+		return WgConfig{}, fmt.Errorf("remote config response exceeds maximum allowed size")
 	}
 	signature, err := base64.StdEncoding.DecodeString(resp.Header.Get(remoteConfigSignatureHeader))
 	if len(signingKey) != ed25519.PublicKeySize || err != nil || !ed25519.Verify(signingKey, data, signature) {
