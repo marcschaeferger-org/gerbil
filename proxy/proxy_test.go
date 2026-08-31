@@ -2,8 +2,80 @@ package proxy
 
 import (
 	"net"
+	"net/http"
 	"testing"
 )
+
+func TestNewSNIProxyRequiresHTTPS(t *testing.T) {
+	if _, err := NewSNIProxy(8443, "http://pangolin.example.com", "", "127.0.0.1", 443, nil, false, nil); err == nil {
+		t.Fatal("expected plaintext remote config URL to be rejected")
+	}
+}
+
+func TestNewSNIProxyValidatesAllowedNetworks(t *testing.T) {
+	if _, err := NewSNIProxy(8443, "https://pangolin.example.com", "", "127.0.0.1", 443, nil, false, nil, "not-a-cidr"); err == nil {
+		t.Fatal("expected invalid allowed network to be rejected")
+	}
+}
+
+func TestRouteAPIRedirectMustRemainOnHTTPSOrigin(t *testing.T) {
+	proxy, err := NewSNIProxy(8443, "https://pangolin.example.com", "", "127.0.0.1", 443, nil, false, nil)
+	if err != nil {
+		t.Fatalf("failed to create SNI proxy: %v", err)
+	}
+
+	original, err := http.NewRequestWithContext(t.Context(), http.MethodPost, "https://pangolin.example.com/api", nil)
+	if err != nil {
+		t.Fatalf("failed to create original request: %v", err)
+	}
+	for _, redirectURL := range []string{
+		"http://pangolin.example.com/api",
+		"https://attacker.example.com/api",
+	} {
+		redirect, err := http.NewRequestWithContext(t.Context(), http.MethodPost, redirectURL, nil)
+		if err != nil {
+			t.Fatalf("failed to create redirect request: %v", err)
+		}
+		if err := proxy.httpClient.CheckRedirect(redirect, []*http.Request{original}); err == nil {
+			t.Errorf("expected redirect to %s to be rejected", redirectURL)
+		}
+	}
+}
+
+func TestDialRouteEnforcesAllowedNetworks(t *testing.T) {
+	var listenConfig net.ListenConfig
+	listener, err := listenConfig.Listen(t.Context(), "tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+	defer func() { _ = listener.Close() }()
+
+	proxy, err := NewSNIProxy(8443, "https://pangolin.example.com", "", "127.0.0.1", 443, nil, false, nil, "127.0.0.0/8")
+	if err != nil {
+		t.Fatalf("failed to create SNI proxy: %v", err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+
+	accepted := make(chan net.Conn, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err == nil {
+			accepted <- conn
+		}
+	}()
+
+	conn, err := proxy.dialRoute(&RouteRecord{TargetHost: "127.0.0.1", TargetPort: port, remote: true})
+	if err != nil {
+		t.Fatalf("expected allowed route to connect: %v", err)
+	}
+	_ = conn.Close()
+	_ = (<-accepted).Close()
+
+	proxy.allowedNetworks = nil
+	if _, err := proxy.dialRoute(&RouteRecord{TargetHost: "127.0.0.1", TargetPort: port, remote: true}); err == nil {
+		t.Fatal("expected route outside allowed networks to be rejected")
+	}
+}
 
 func TestBuildProxyProtocolHeader(t *testing.T) {
 	tests := []struct {

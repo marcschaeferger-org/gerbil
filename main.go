@@ -52,6 +52,13 @@ var (
 	disableFirewall  bool
 )
 
+var remoteConfigHTTPClient = &http.Client{
+	Timeout: 5 * time.Second,
+	CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+		return fmt.Errorf("remote config redirects are not allowed")
+	},
+}
+
 type WgConfig struct {
 	PrivateKey string `json:"privateKey"`
 	ListenPort int    `json:"listenPort"`
@@ -137,6 +144,173 @@ func hostname(hostport string) string {
 	return hostport
 }
 
+func validateRouterDestination(dest string) error {
+	scheme, hostport := splitDestHeader(dest)
+	if scheme != "http" && scheme != "https" {
+		return fmt.Errorf("unsupported destination scheme %q", scheme)
+	}
+
+	host, portString, err := net.SplitHostPort(hostport)
+	if err != nil || host == "" {
+		return errors.New("invalid destination address")
+	}
+	port, err := strconv.Atoi(portString)
+	if err != nil || port < 1 || port > 65535 {
+		return errors.New("invalid destination port")
+	}
+	return nil
+}
+
+func routerAllowedNetworks() ([]net.IPNet, error) {
+	wgMu.Lock()
+	defer wgMu.Unlock()
+
+	if wgClient == nil {
+		return nil, errors.New("WireGuard client is not initialized")
+	}
+	device, err := wgClient.Device(interfaceName)
+	if err != nil {
+		return nil, fmt.Errorf("read WireGuard peers: %w", err)
+	}
+
+	var networks []net.IPNet
+	for _, peer := range device.Peers {
+		networks = append(networks, peer.AllowedIPs...)
+	}
+	return networks, nil
+}
+
+type routerCIDRNode struct {
+	children       [2]*routerCIDRNode
+	networkIndexes []int
+}
+
+func routerCIDRCovered(node *routerCIDRNode) bool {
+	if node == nil {
+		return false
+	}
+	if len(node.networkIndexes) != 0 {
+		return true
+	}
+	return routerCIDRCovered(node.children[0]) && routerCIDRCovered(node.children[1])
+}
+
+func markRouterCIDRCover(node *routerCIDRNode, blocked map[int]struct{}) {
+	if len(node.networkIndexes) != 0 {
+		for _, index := range node.networkIndexes {
+			blocked[index] = struct{}{}
+		}
+		return
+	}
+	markRouterCIDRCover(node.children[0], blocked)
+	markRouterCIDRCover(node.children[1], blocked)
+}
+
+func unrestrictedRouterNetworks(networks []net.IPNet) map[int]struct{} {
+	blocked := make(map[int]struct{})
+	for {
+		roots := map[int]*routerCIDRNode{
+			net.IPv4len * 8: {},
+			net.IPv6len * 8: {},
+		}
+		for index, network := range networks {
+			if _, skip := blocked[index]; skip {
+				continue
+			}
+			ones, bits := network.Mask.Size()
+			ip := network.IP
+			if bits == net.IPv4len*8 {
+				ip = ip.To4()
+			} else if bits == net.IPv6len*8 {
+				ip = ip.To16()
+			} else {
+				continue
+			}
+
+			node := roots[bits]
+			for bit := 0; bit < ones; bit++ {
+				direction := (ip[bit/8] >> (7 - bit%8)) & 1
+				if node.children[direction] == nil {
+					node.children[direction] = &routerCIDRNode{}
+				}
+				node = node.children[direction]
+			}
+			node.networkIndexes = append(node.networkIndexes, index)
+		}
+
+		changed := false
+		for _, root := range roots {
+			if routerCIDRCovered(root) {
+				markRouterCIDRCover(root, blocked)
+				changed = true
+			}
+		}
+		if !changed {
+			return blocked
+		}
+	}
+}
+
+func routerIPAllowed(ip net.IP, networks []net.IPNet) bool {
+	if ip == nil || !ip.IsGlobalUnicast() {
+		return false
+	}
+	unrestricted := unrestrictedRouterNetworks(networks)
+	for index, network := range networks {
+		if _, blocked := unrestricted[index]; !blocked && network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// dialRouterContext resolves once, verifies every answer against the configured
+// WireGuard peer networks, and dials a verified numeric IP to prevent DNS
+// rebinding between validation and connection establishment.
+func dialRouterContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid router address: %w", err)
+	}
+	resolved, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, fmt.Errorf("resolve router destination: %w", err)
+	}
+	if len(resolved) == 0 {
+		return nil, errors.New("router destination resolved to no addresses")
+	}
+	allowedNetworks, err := routerAllowedNetworks()
+	if err != nil {
+		return nil, err
+	}
+	for _, candidate := range resolved {
+		if !routerIPAllowed(candidate.IP, allowedNetworks) {
+			return nil, fmt.Errorf("router destination resolved to disallowed address %s", candidate.IP)
+		}
+	}
+
+dialer := &net.Dialer{
+		Control: func(_, _ string, conn syscall.RawConn) error {
+			var socketErr error
+			if err := conn.Control(func(fd uintptr) {
+				socketErr = syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, interfaceName)
+			}); err != nil {
+				return err
+			}
+			return socketErr
+		},
+	}
+	var dialErrors []error
+	for _, candidate := range resolved {
+		conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(candidate.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+		dialErrors = append(dialErrors, err)
+	}
+	return nil, errors.Join(dialErrors...)
+}
+
 // routerSNIContextKey carries the TLS ServerName (SNI) that
 // routerTransport's DialTLSContext should present, since we dial the
 // WireGuard destination IP but the remote end typically terminates TLS
@@ -149,14 +323,22 @@ type routerSNIContextKey struct{}
 // (the WireGuard IP), which the destination's TLS termination won't have a
 // matching certificate/route for.
 var routerTransport = &http.Transport{
-	Proxy: http.ProxyFromEnvironment,
+	DialContext: dialRouterContext,
 	DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 		serverName := hostname(addr)
 		if sni, ok := ctx.Value(routerSNIContextKey{}).(string); ok && sni != "" {
 			serverName = sni
 		}
-		dialer := &tls.Dialer{Config: &tls.Config{ServerName: serverName}}
-		return dialer.DialContext(ctx, network, addr)
+		conn, err := dialRouterContext(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		tlsConn := tls.Client(conn, &tls.Config{ServerName: serverName})
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		return tlsConn, nil
 	},
 }
 
@@ -235,8 +417,7 @@ func handleRouter(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("Missing %s header", pangolinDestHeader), http.StatusBadRequest)
 		return
 	}
-	_, host := splitDestHeader(dest)
-	if _, _, err := net.SplitHostPort(host); err != nil {
+	if err := validateRouterDestination(dest); err != nil {
 		http.Error(w, "Invalid destination", http.StatusBadRequest)
 		return
 	}
@@ -315,6 +496,7 @@ func main() {
 		localProxyPort       int
 		localOverridesStr    string
 		trustedUpstreamsStr  string
+		proxyAllowedCIDRsStr string
 		proxyProtocol        bool
 
 		// Metrics configuration variables (set from env, then overridden by CLI flags)
@@ -343,6 +525,7 @@ func main() {
 	localProxyPortStr := os.Getenv("LOCAL_PROXY_PORT")
 	localOverridesStr = os.Getenv("LOCAL_OVERRIDES")
 	trustedUpstreamsStr = os.Getenv("TRUSTED_UPSTREAMS")
+	proxyAllowedCIDRsStr = os.Getenv("SNI_PROXY_ALLOWED_CIDRS")
 	proxyProtocolStr := os.Getenv("PROXY_PROTOCOL")
 	doTrafficShapingStr := os.Getenv("DO_TRAFFIC_SHAPING")
 	bandwidthLimitStr := os.Getenv("BANDWIDTH_LIMIT")
@@ -453,6 +636,9 @@ func main() {
 	if trustedUpstreamsStr == "" {
 		flag.StringVar(&trustedUpstreamsStr, "trusted-upstreams", "", "Comma-separated list of trusted upstream proxy domain names/IPs that can send PROXY protocol")
 	}
+	if proxyAllowedCIDRsStr == "" {
+		flag.StringVar(&proxyAllowedCIDRsStr, "sni-proxy-allowed-cidrs", "", "Comma-separated CIDRs allowed as remote SNI proxy targets")
+	}
 
 	if proxyProtocolStr != "" {
 		proxyProtocol = strings.ToLower(proxyProtocolStr) == "true"
@@ -494,6 +680,9 @@ func main() {
 	flag.BoolVar(&allowInsecureRemoteConfig, "allow-insecure-remote-config", allowInsecureRemoteConfig, "Allow plaintext HTTP remote config for development only")
 
 	flag.Parse()
+	if err := proxy.ValidateRemoteConfigURL(remoteConfigURL); err != nil {
+		log.Fatal(err)
+	}
 
 	// Heap profiles are dumped into the configured config directory (the same
 	// directory as the config file, or /var/config as a fallback for remote-config
@@ -594,26 +783,9 @@ func main() {
 	var key wgtypes.Key
 	// if generateAndSaveKeyTo is provided, generate a private key and save it to the file. if the file already exists, load the key from the file
 	if generateAndSaveKeyTo != "" {
-		if _, err := os.Stat(generateAndSaveKeyTo); os.IsNotExist(err) {
-			// generate a new private key
-			key, err = wgtypes.GeneratePrivateKey()
-			if err != nil {
-				logger.Fatal("Failed to generate private key: %v", err)
-			}
-			// save the key to the file
-			err = os.WriteFile(generateAndSaveKeyTo, []byte(key.String()), 0644)
-			if err != nil {
-				logger.Fatal("Failed to save private key: %v", err)
-			}
-		} else {
-			keyData, err := os.ReadFile(generateAndSaveKeyTo)
-			if err != nil {
-				logger.Fatal("Failed to read private key: %v", err)
-			}
-			key, err = wgtypes.ParseKey(string(keyData))
-			if err != nil {
-				logger.Fatal("Failed to parse private key: %v", err)
-			}
+		key, err = loadOrGeneratePrivateKey(generateAndSaveKeyTo)
+		if err != nil {
+			logger.Fatal("Failed to load or generate private key: %v", err)
 		}
 	} else {
 		// if no generateAndSaveKeyTo is provided, ensure that the private key is provided
@@ -721,7 +893,15 @@ func main() {
 		logger.Info("Trusted upstreams configured: %v", trustedUpstreams)
 	}
 
-	proxySNI, err = proxy.NewSNIProxy(sniProxyPort, remoteConfigURL, key.PublicKey().String(), localProxyAddr, localProxyPort, localOverrides, proxyProtocol, trustedUpstreams)
+	var proxyAllowedCIDRs []string
+	if proxyAllowedCIDRsStr != "" {
+		proxyAllowedCIDRs = strings.Split(proxyAllowedCIDRsStr, ",")
+		for i, network := range proxyAllowedCIDRs {
+			proxyAllowedCIDRs[i] = strings.TrimSpace(network)
+		}
+	}
+
+	proxySNI, err = proxy.NewSNIProxy(sniProxyPort, remoteConfigURL, key.PublicKey().String(), localProxyAddr, localProxyPort, localOverrides, proxyProtocol, trustedUpstreams, proxyAllowedCIDRs...)
 	if err != nil {
 		logger.Fatal("Failed to create proxy: %v", err)
 	}
@@ -783,6 +963,53 @@ func main() {
 	} else if errors.Is(err, context.Canceled) {
 		logger.Info("Context cancelled, shutting down")
 	}
+}
+
+func loadOrGeneratePrivateKey(path string) (wgtypes.Key, error) {
+	keyFile, err := os.Open(path)
+	if err == nil {
+		defer keyFile.Close()
+
+		fileInfo, err := keyFile.Stat()
+		if err != nil {
+			return wgtypes.Key{}, fmt.Errorf("failed to inspect private key file: %w", err)
+		}
+		if fileInfo.Mode().Perm()&0077 != 0 {
+			return wgtypes.Key{}, fmt.Errorf("private key file has insecure permissions %04o", fileInfo.Mode().Perm())
+		}
+
+		keyData, err := io.ReadAll(keyFile)
+		if err != nil {
+			return wgtypes.Key{}, fmt.Errorf("failed to read private key: %w", err)
+		}
+		key, err := wgtypes.ParseKey(string(keyData))
+		if err != nil {
+			return wgtypes.Key{}, fmt.Errorf("failed to parse private key: %w", err)
+		}
+		return key, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return wgtypes.Key{}, fmt.Errorf("failed to open private key file: %w", err)
+	}
+
+	key, err := wgtypes.GeneratePrivateKey()
+	if err != nil {
+		return wgtypes.Key{}, fmt.Errorf("failed to generate private key: %w", err)
+	}
+	keyFile, err = os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return wgtypes.Key{}, fmt.Errorf("failed to create private key file: %w", err)
+	}
+	if _, err := io.WriteString(keyFile, key.String()); err != nil {
+		if closeErr := keyFile.Close(); closeErr != nil {
+			return wgtypes.Key{}, fmt.Errorf("failed to write private key: %v; additionally failed to close private key file: %w", err, closeErr)
+		}
+		return wgtypes.Key{}, fmt.Errorf("failed to write private key: %w", err)
+	}
+	if err := keyFile.Close(); err != nil {
+		return wgtypes.Key{}, fmt.Errorf("failed to close private key file: %w", err)
+	}
+	return key, nil
 }
 
 func loadRemoteConfig(ctx context.Context, client *http.Client, url string, key wgtypes.Key, reachableAt string) (WgConfig, error) {
