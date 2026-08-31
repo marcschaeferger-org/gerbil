@@ -1027,7 +1027,7 @@ type idleDeadlineReader struct {
 
 func (r idleDeadlineReader) Read(buf []byte) (int, error) {
 	n, err := r.reader.Read(buf)
-	if n > 0 {
+	if n > 0 && err == nil {
 		if refreshErr := r.refresh(); refreshErr != nil {
 			return n, refreshErr
 		}

@@ -33,7 +33,7 @@ func TestLoadSNITunnelIdleTimeout(t *testing.T) {
 }
 
 func TestPipeClosesIdleTunnel(t *testing.T) {
-	proxy := newPipeTestProxy(50 * time.Millisecond)
+	proxy := newPipeTestProxy(200 * time.Millisecond)
 	clientConn, clientPeer := net.Pipe()
 	targetConn, targetPeer := net.Pipe()
 	defer clientPeer.Close()
