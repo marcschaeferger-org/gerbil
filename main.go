@@ -3,9 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -56,12 +58,7 @@ var (
 	controlAPIToken  string
 )
 
-var remoteConfigHTTPClient = &http.Client{
-	Timeout: 5 * time.Second,
-	CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
-		return fmt.Errorf("remote config redirects are not allowed")
-	},
-}
+const remoteConfigSignatureHeader = "X-Gerbil-Config-Signature"
 
 type WgConfig struct {
 	PrivateKey string `json:"privateKey"`
@@ -491,6 +488,7 @@ func main() {
 		wgconfig             WgConfig
 		configFile           string
 		remoteConfigURL      string
+		remoteConfigKey      string
 		generateAndSaveKeyTo string
 		reachableAt          string
 		logLevel             string
@@ -517,6 +515,7 @@ func main() {
 	interfaceName = os.Getenv("INTERFACE")
 	configFile = os.Getenv("CONFIG")
 	remoteConfigURL = os.Getenv("REMOTE_CONFIG")
+	remoteConfigKey = os.Getenv("REMOTE_CONFIG_SIGNING_KEY")
 	listenAddr = os.Getenv("LISTEN")
 	generateAndSaveKeyTo = os.Getenv("GENERATE_AND_SAVE_KEY_TO")
 	reachableAt = os.Getenv("REACHABLE_AT")
@@ -535,7 +534,6 @@ func main() {
 	doTrafficShapingStr := os.Getenv("DO_TRAFFIC_SHAPING")
 	bandwidthLimitStr := os.Getenv("BANDWIDTH_LIMIT")
 	disableFirewallStr := os.Getenv("DISABLE_FIREWALL")
-	allowInsecureRemoteConfig := strings.EqualFold(os.Getenv("ALLOW_INSECURE_REMOTE_CONFIG"), "true")
 
 	// Read metrics env vars (defaults applied by DefaultMetricsConfig; these override defaults).
 	metricsEnabled = true // default
@@ -587,6 +585,9 @@ func main() {
 	}
 	if remoteConfigURL == "" {
 		flag.StringVar(&remoteConfigURL, "remoteConfig", "", "URL of the Pangolin server")
+	}
+	if remoteConfigKey == "" {
+		flag.StringVar(&remoteConfigKey, "remote-config-signing-key", "", "Base64-encoded Ed25519 public key for remote config verification")
 	}
 	if listenAddr == "" {
 		flag.StringVar(&listenAddr, "listen", "", "DEPRECATED (overridden by reachableAt): Address to listen on")
@@ -682,8 +683,6 @@ func main() {
 	flag.BoolVar(&otelMetricsInsecure, "otel-metrics-insecure", otelMetricsInsecure, "Disable TLS for OTLP connection")
 	flag.DurationVar(&otelMetricsExportInterval, "otel-metrics-export-interval", otelMetricsExportInterval, "Interval between OTLP metric pushes")
 	flag.DurationVar(&otelMetricsTimeout, "otel-metrics-timeout", otelMetricsTimeout, "Timeout for OTLP exporter setup")
-	flag.BoolVar(&allowInsecureRemoteConfig, "allow-insecure-remote-config", allowInsecureRemoteConfig, "Allow plaintext HTTP remote config for development only")
-
 	flag.Parse()
 	if err := proxy.ValidateRemoteConfigURL(remoteConfigURL); err != nil {
 		log.Fatal(err)
@@ -776,15 +775,23 @@ func main() {
 		logger.Fatal("You must provide either a config file or a remote config URL, not both")
 	}
 
+	var remoteConfigSigningKey ed25519.PublicKey
+	if remoteConfigURL != "" {
+		remoteConfigSigningKey, err = parseRemoteConfigSigningKey(remoteConfigKey)
+		if err != nil {
+			logger.Fatal("Invalid remote config signing key: %v", err)
+		}
+	}
+
 	// clean up the reomte config URL for backwards compatibility
 	remoteConfigURL = strings.TrimSuffix(remoteConfigURL, "/gerbil/get-config")
 	remoteConfigURL = strings.TrimSuffix(remoteConfigURL, "/")
 	if remoteConfigURL != "" {
-		if err := relay.ValidateRemoteConfigURL(remoteConfigURL, allowInsecureRemoteConfig); err != nil {
+		if err := relay.ValidateRemoteConfigURL(remoteConfigURL); err != nil {
 			logger.Fatal("Invalid remote config URL: %v", err)
 		}
 	}
-	controlPlaneHTTPClient := relay.NewControlPlaneHTTPClient(allowInsecureRemoteConfig)
+	controlPlaneHTTPClient := relay.NewControlPlaneHTTPClient()
 
 	var key wgtypes.Key
 	// if generateAndSaveKeyTo is provided, generate a private key and save it to the file. if the file already exists, load the key from the file
@@ -817,7 +824,7 @@ func main() {
 		// loop until we get the config
 		for wgconfig.PrivateKey == "" {
 			logger.Info("Fetching remote config from %s", remoteConfigURL+"/gerbil/get-config")
-			wgconfig, err = loadRemoteConfig(ctx, controlPlaneHTTPClient, remoteConfigURL+"/gerbil/get-config", key, reachableAt)
+			wgconfig, err = loadRemoteConfig(ctx, controlPlaneHTTPClient, remoteConfigURL+"/gerbil/get-config", key, reachableAt, remoteConfigSigningKey)
 			if err != nil {
 				if ctx.Err() != nil {
 					return
@@ -867,7 +874,7 @@ func main() {
 		relayPort = 21820 // in case there is no relay port set, use 21820
 	}
 	if remoteConfigURL != "" {
-		proxyRelay, err = relay.NewUDPProxyServer(groupCtx, fmt.Sprintf(":%d", relayPort), remoteConfigURL, key, reachableAt, allowInsecureRemoteConfig)
+		proxyRelay, err = relay.NewUDPProxyServer(groupCtx, fmt.Sprintf(":%d", relayPort), remoteConfigURL, key, reachableAt)
 		if err != nil {
 			logger.Fatal("Failed to configure UDP proxy server: %v", err)
 		}
@@ -1028,7 +1035,25 @@ func loadOrGeneratePrivateKey(path string) (wgtypes.Key, error) {
 	return key, nil
 }
 
-func loadRemoteConfig(ctx context.Context, client *http.Client, url string, key wgtypes.Key, reachableAt string) (WgConfig, error) {
+func parseRemoteConfigSigningKey(encoded string) (ed25519.PublicKey, error) {
+	if encoded == "" {
+		return nil, fmt.Errorf("REMOTE_CONFIG_SIGNING_KEY is required with REMOTE_CONFIG")
+	}
+	key, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil, fmt.Errorf("must be valid base64: %w", err)
+	}
+	if len(key) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("must decode to %d bytes", ed25519.PublicKeySize)
+	}
+	return ed25519.PublicKey(key), nil
+}
+
+func loadRemoteConfig(ctx context.Context, client *http.Client, url string, key wgtypes.Key, reachableAt string, signingKey ed25519.PublicKey) (WgConfig, error) {
+	if err := relay.ValidateRemoteConfigURL(url); err != nil {
+		metrics.RecordRemoteConfigFetch("error")
+		return WgConfig{}, err
+	}
 	var body *bytes.Buffer
 	if reachableAt == "" {
 		body = bytes.NewBuffer([]byte(fmt.Sprintf(`{"publicKey": %q}`, key.PublicKey().String())))
@@ -1055,6 +1080,11 @@ func loadRemoteConfig(ctx context.Context, client *http.Client, url string, key 
 	if err != nil {
 		metrics.RecordRemoteConfigFetch("error")
 		return WgConfig{}, err
+	}
+	signature, err := base64.StdEncoding.DecodeString(resp.Header.Get(remoteConfigSignatureHeader))
+	if len(signingKey) != ed25519.PublicKeySize || err != nil || !ed25519.Verify(signingKey, data, signature) {
+		metrics.RecordRemoteConfigFetch("error")
+		return WgConfig{}, fmt.Errorf("remote config signature verification failed")
 	}
 
 	var config WgConfig

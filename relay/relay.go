@@ -14,7 +14,6 @@ import (
 	"os"
 	"runtime"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -293,9 +292,8 @@ type UDPProxyServer struct {
 	ReachableAt string
 }
 
-// ValidateRemoteConfigURL ensures control-plane traffic is encrypted unless
-// plaintext HTTP was explicitly enabled for development.
-func ValidateRemoteConfigURL(serverURL string, allowInsecureHTTP bool) error {
+// ValidateRemoteConfigURL ensures control-plane traffic is encrypted.
+func ValidateRemoteConfigURL(serverURL string) error {
 	u, err := url.Parse(serverURL)
 	if err != nil {
 		return fmt.Errorf("invalid remote config URL: %w", err)
@@ -307,22 +305,15 @@ func ValidateRemoteConfigURL(serverURL string, allowInsecureHTTP bool) error {
 		return fmt.Errorf("remote config URL must include a host")
 	}
 
-	switch strings.ToLower(u.Scheme) {
-	case "https":
-		return nil
-	case "http":
-		if allowInsecureHTTP {
-			return nil
-		}
-		return fmt.Errorf("remote config URL must use HTTPS (plaintext HTTP is allowed only with the development override)")
-	default:
+	if u.Scheme != "https" {
 		return fmt.Errorf("remote config URL must use HTTPS")
 	}
+	return nil
 }
 
 // NewControlPlaneHTTPClient returns a client that preserves the remote-config
 // transport policy across redirects and bounds waits for response headers.
-func NewControlPlaneHTTPClient(allowInsecureHTTP bool) *http.Client {
+func NewControlPlaneHTTPClient() *http.Client {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.ResponseHeaderTimeout = 30 * time.Second
 
@@ -332,15 +323,15 @@ func NewControlPlaneHTTPClient(allowInsecureHTTP bool) *http.Client {
 			if len(via) >= 10 {
 				return fmt.Errorf("stopped after 10 redirects")
 			}
-			return ValidateRemoteConfigURL(req.URL.String(), allowInsecureHTTP)
+			return ValidateRemoteConfigURL(req.URL.String())
 		},
 	}
 }
 
 // NewUDPProxyServer initializes the server with a buffered packet channel and derived context.
-func NewUDPProxyServer(parentCtx context.Context, addr, serverURL string, privateKey wgtypes.Key, reachableAt string, allowInsecureHTTP bool) (*UDPProxyServer, error) {
+func NewUDPProxyServer(parentCtx context.Context, addr, serverURL string, privateKey wgtypes.Key, reachableAt string) (*UDPProxyServer, error) {
 	if serverURL != "" {
-		if err := ValidateRemoteConfigURL(serverURL, allowInsecureHTTP); err != nil {
+		if err := ValidateRemoteConfigURL(serverURL); err != nil {
 			return nil, err
 		}
 	}
@@ -349,7 +340,7 @@ func NewUDPProxyServer(parentCtx context.Context, addr, serverURL string, privat
 	return &UDPProxyServer{
 		addr:              addr,
 		serverURL:         serverURL,
-		httpClient:        NewControlPlaneHTTPClient(allowInsecureHTTP),
+		httpClient:        NewControlPlaneHTTPClient(),
 		privateKey:        privateKey,
 		packetChan:        make(chan Packet, 50000), // Increased from 1000 to handle high throughput
 		lastEndpointCache: newEndpointCache(maxEndpointCacheEntries, endpointCacheTTL),
