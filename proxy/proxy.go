@@ -488,7 +488,7 @@ func ValidateRemoteConfigURL(remoteConfigURL string) error {
 		return nil
 	}
 	parsedURL, err := url.Parse(remoteConfigURL)
-	if err != nil || parsedURL.Scheme != "https" || parsedURL.Host == "" {
+	if err != nil || parsedURL.Scheme != "https" || parsedURL.Hostname() == "" {
 		return fmt.Errorf("remote config URL must use authenticated HTTPS")
 	}
 	return nil
