@@ -17,7 +17,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httputil"
-	_ "net/http/pprof"
+	httppprof "net/http/pprof"
 	"net/url"
 	"os"
 	"os/exec"
@@ -906,19 +906,20 @@ func main() {
 	}
 
 	// Set up HTTP server with metrics middleware
-	http.Handle("/peer", requireControlAuth(httpMetricsMiddleware("peer", handlePeer)))
-	http.Handle("/update-proxy-mapping", requireControlAuth(httpMetricsMiddleware("update_proxy_mapping", handleUpdateProxyMapping)))
-	http.Handle("/update-destinations", requireControlAuth(httpMetricsMiddleware("update_destinations", handleUpdateDestinations)))
-	http.Handle("/update-local-snis", requireControlAuth(httpMetricsMiddleware("update_local_snis", handleUpdateLocalSNIs)))
-	http.HandleFunc("/healthz", httpMetricsMiddleware("healthz", handleHealthz))
-	http.HandleFunc("/router/", httpMetricsMiddleware("router", handleRouter))
+	apiMux := http.NewServeMux()
+	apiMux.Handle("/peer", requireControlAuth(httpMetricsMiddleware("peer", handlePeer)))
+	apiMux.Handle("/update-proxy-mapping", requireControlAuth(httpMetricsMiddleware("update_proxy_mapping", handleUpdateProxyMapping)))
+	apiMux.Handle("/update-destinations", requireControlAuth(httpMetricsMiddleware("update_destinations", handleUpdateDestinations)))
+	apiMux.Handle("/update-local-snis", requireControlAuth(httpMetricsMiddleware("update_local_snis", handleUpdateLocalSNIs)))
+	apiMux.HandleFunc("/healthz", httpMetricsMiddleware("healthz", handleHealthz))
+	apiMux.HandleFunc("/router/", httpMetricsMiddleware("router", handleRouter))
 
 	// Register metrics endpoint only for Prometheus backend.
 	// OTel backend pushes to a collector; no /metrics endpoint needed.
 	// Note: metricsPath is registered directly without httpMetricsMiddleware to prevent infinite recursion.
 	// The metricsHandler must not be wrapped by the middleware, as it would observe its own observation calls.
 	if metricsHandler != nil {
-		http.Handle(metricsPath, metricsHandler)
+		apiMux.Handle(metricsPath, metricsHandler)
 		logger.Info("Metrics endpoint enabled at %s", metricsPath)
 	}
 
@@ -937,9 +938,24 @@ func main() {
 	// HTTP server with graceful shutdown on context cancel
 	server := &http.Server{
 		Addr:              listenAddr,
-		Handler:           nil,
+		Handler:           apiMux,
 		ReadHeaderTimeout: 3 * time.Second,
 	}
+
+	// Keep profiling available to local operators without exposing it on the public API listener.
+	pprofMux := http.NewServeMux()
+	pprofMux.HandleFunc("GET /debug/pprof/", httppprof.Index)
+	pprofMux.HandleFunc("GET /debug/pprof/cmdline", httppprof.Cmdline)
+	pprofMux.HandleFunc("GET /debug/pprof/profile", httppprof.Profile)
+	pprofMux.HandleFunc("GET /debug/pprof/symbol", httppprof.Symbol)
+	pprofMux.HandleFunc("GET /debug/pprof/trace", httppprof.Trace)
+	pprofServer := &http.Server{
+		Addr:              "127.0.0.1:6060",
+		Handler:           pprofMux,
+		ReadHeaderTimeout: 3 * time.Second,
+	}
+	logger.Info("Starting pprof server on %s", pprofServer.Addr)
+
 	group.Go(func() error {
 		// http.ErrServerClosed is returned on graceful shutdown; not an error for us
 		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -948,10 +964,17 @@ func main() {
 		return nil
 	})
 	group.Go(func() error {
+		if err := pprofServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			logger.Warn("pprof server unavailable: %v", err)
+		}
+		return nil
+	})
+	group.Go(func() error {
 		<-groupCtx.Done()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = server.Shutdown(shutdownCtx)
+		_ = pprofServer.Shutdown(shutdownCtx)
 		// Stop background components as the context is canceled
 		if proxySNI != nil {
 			_ = proxySNI.Stop()
