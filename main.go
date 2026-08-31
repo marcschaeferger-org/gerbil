@@ -3,6 +3,8 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -14,6 +16,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	_ "net/http/pprof"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -50,6 +53,7 @@ var (
 	bandwidthLimit   string
 	ifbName          string // IFB device name for ingress traffic shaping
 	disableFirewall  bool
+	controlAPIToken  string
 )
 
 var remoteConfigHTTPClient = &http.Client{
@@ -519,6 +523,7 @@ func main() {
 	logLevel = os.Getenv("LOG_LEVEL")
 	mtu = os.Getenv("MTU")
 	notifyURL = os.Getenv("NOTIFY_URL")
+	controlAPIToken = os.Getenv("CONTROL_API_TOKEN")
 
 	sniProxyPortStr := os.Getenv("SNI_PORT")
 	localProxyAddr = os.Getenv("LOCAL_PROXY")
@@ -737,20 +742,21 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// try to parse as http://host:port and set the listenAddr to the :port from this reachableAt.
+	// Bind to the concrete host advertised by reachableAt when LISTEN is not set.
 	if reachableAt != "" && listenAddr == "" {
-		if strings.HasPrefix(reachableAt, "http://") || strings.HasPrefix(reachableAt, "https://") {
-			parts := strings.Split(reachableAt, ":")
-			if len(parts) == 3 {
-				port := parts[2]
-				if strings.Contains(port, "/") {
-					port = strings.Split(port, "/")[0]
-				}
-				listenAddr = ":" + port
-			}
+		advertisedURL, parseErr := url.Parse(reachableAt)
+		if parseErr != nil || (advertisedURL.Scheme != "http" && advertisedURL.Scheme != "https") ||
+			advertisedURL.Hostname() == "" || advertisedURL.Port() == "" {
+			logger.Fatal("--reachableAt / REACHABLE_AT must be an HTTP(S) URL with an explicit port, or --listen / LISTEN must be set")
 		}
-	} else if listenAddr == "" {
-		listenAddr = ":3003"
+		listenAddr = net.JoinHostPort(advertisedURL.Hostname(), advertisedURL.Port())
+	}
+	if listenAddr == "" {
+		listenAddr = "127.0.0.1:3003"
+	}
+
+	if len(controlAPIToken) < 32 {
+		logger.Fatal("CONTROL_API_TOKEN must be set to a secret of at least 32 characters")
 	}
 
 	mtuInt, err = strconv.Atoi(mtu)
@@ -893,10 +899,10 @@ func main() {
 	}
 
 	// Set up HTTP server with metrics middleware
-	http.HandleFunc("/peer", httpMetricsMiddleware("peer", handlePeer))
-	http.HandleFunc("/update-proxy-mapping", httpMetricsMiddleware("update_proxy_mapping", handleUpdateProxyMapping))
-	http.HandleFunc("/update-destinations", httpMetricsMiddleware("update_destinations", handleUpdateDestinations))
-	http.HandleFunc("/update-local-snis", httpMetricsMiddleware("update_local_snis", handleUpdateLocalSNIs))
+	http.Handle("/peer", requireControlAuth(httpMetricsMiddleware("peer", handlePeer)))
+	http.Handle("/update-proxy-mapping", requireControlAuth(httpMetricsMiddleware("update_proxy_mapping", handleUpdateProxyMapping)))
+	http.Handle("/update-destinations", requireControlAuth(httpMetricsMiddleware("update_destinations", handleUpdateDestinations)))
+	http.Handle("/update-local-snis", requireControlAuth(httpMetricsMiddleware("update_local_snis", handleUpdateLocalSNIs)))
 	http.HandleFunc("/healthz", httpMetricsMiddleware("healthz", handleHealthz))
 	http.HandleFunc("/router/", httpMetricsMiddleware("router", handleRouter))
 
@@ -909,7 +915,17 @@ func main() {
 		logger.Info("Metrics endpoint enabled at %s", metricsPath)
 	}
 
-	logger.Info("Starting HTTP server on %s", listenAddr)
+	listener, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		logger.Fatal("Failed to listen on %s: %v", listenAddr, err)
+	}
+	listenerIP := listener.Addr().(*net.TCPAddr).IP
+	if !listenerIP.IsLoopback() && !listenerIP.IsPrivate() {
+		_ = listener.Close()
+		logger.Fatal("Refusing to expose the control plane on non-private address %s", listenerIP)
+	}
+
+	logger.Info("Starting HTTP server on %s", listener.Addr())
 
 	// HTTP server with graceful shutdown on context cancel
 	server := &http.Server{
@@ -919,7 +935,7 @@ func main() {
 	}
 	group.Go(func() error {
 		// http.ErrServerClosed is returned on graceful shutdown; not an error for us
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			return err
 		}
 		return nil
@@ -1451,6 +1467,25 @@ func handlePeer(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+func requireControlAuth(next http.Handler) http.Handler {
+	controlTokenHash := sha256.Sum256([]byte(controlAPIToken))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		scheme, token, ok := strings.Cut(r.Header.Get("Authorization"), " ")
+		const maxTokenLen = 1024
+		if len(token) > maxTokenLen {
+			token = token[:maxTokenLen]
+		}
+		providedTokenHash := sha256.Sum256([]byte(token))
+		if !ok || !strings.EqualFold(scheme, "Bearer") || token == "" ||
+			subtle.ConstantTimeCompare(providedTokenHash[:], controlTokenHash[:]) != 1 {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
 }
 
 func handleHealthz(w http.ResponseWriter, r *http.Request) {
