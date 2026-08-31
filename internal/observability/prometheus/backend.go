@@ -297,10 +297,24 @@ func normalizeLabels(labelNames []string, labels map[string]string, droppedSampl
 			log.Printf("WARN: dropping metric sample due to unexpected label key %q (expected=%v)", k, labelNames)
 			return nil, false
 		}
+		if k == "method" {
+			v = normalizeHTTPMethod(v)
+		}
 		normalized[k] = v
 	}
 
 	return normalized, true
+}
+
+func normalizeHTTPMethod(method string) string {
+	switch method {
+	case http.MethodConnect, http.MethodDelete, http.MethodGet, http.MethodHead,
+		http.MethodOptions, http.MethodPatch, http.MethodPost, http.MethodPut,
+		http.MethodTrace:
+		return method
+	default:
+		return "other"
+	}
 }
 
 func guardMetricPanic(kind string, expected []string, labels map[string]string) {
