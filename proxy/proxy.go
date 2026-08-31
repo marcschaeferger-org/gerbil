@@ -322,31 +322,7 @@ func (p *SNIProxy) buildProxyProtocolHeaderFromInfo(proxyInfo *ProxyProtocolInfo
 		return "PROXY UNKNOWN\r\n"
 	}
 
-	if srcIP.To4() != nil {
-		// Source is IPv4, use TCP4 protocol
-		protocol = "TCP4"
-		if targetTCP.IP.To4() != nil {
-			// Target is also IPv4, use as-is
-			targetIP = targetTCP.IP.String()
-		} else {
-			// Target is IPv6, but we need IPv4 for consistent protocol family
-			if targetTCP.IP.IsLoopback() {
-				targetIP = "127.0.0.1"
-			} else {
-				targetIP = "127.0.0.1" // Safe fallback
-			}
-		}
-	} else {
-		// Source is IPv6, use TCP6 protocol
-		protocol = "TCP6"
-		if targetTCP.IP.To4() != nil {
-			// Target is IPv4, convert to IPv6 representation
-			targetIP = "::ffff:" + targetTCP.IP.String()
-		} else {
-			// Target is also IPv6, use as-is
-			targetIP = targetTCP.IP.String()
-		}
-	}
+	protocol, targetIP = determineProxyProtocolAndTargetIP(srcIP, targetTCP.IP)
 
 	return fmt.Sprintf("PROXY %s %s %s %d %d\r\n",
 		protocol,
@@ -354,6 +330,30 @@ func (p *SNIProxy) buildProxyProtocolHeaderFromInfo(proxyInfo *ProxyProtocolInfo
 		targetIP,
 		proxyInfo.SrcPort,
 		targetTCP.Port)
+}
+
+// buildProxyProtocolHeader creates a PROXY protocol v1 header
+func determineProxyProtocolAndTargetIP(clientIP, targetIP net.IP) (string, string) {
+	// Determine protocol family based on client IP and normalize target IP accordingly.
+	if clientIP.To4() != nil {
+		// Client is IPv4, use TCP4 protocol.
+		if targetIP.To4() != nil {
+			// Target is also IPv4, use as-is.
+			return "TCP4", targetIP.String()
+		}
+
+		// Target is IPv6; use IPv4 loopback as a safe fallback for TCP4 header consistency.
+		return "TCP4", "127.0.0.1"
+	}
+
+	// Client is IPv6, use TCP6 protocol.
+	if targetIP.To4() != nil {
+		// Target is IPv4, convert to IPv6 representation.
+		return "TCP6", "::ffff:" + targetIP.String()
+	}
+
+	// Target is also IPv6, use as-is.
+	return "TCP6", targetIP.String()
 }
 
 // buildProxyProtocolHeader creates a PROXY protocol v1 header
@@ -370,43 +370,12 @@ func buildProxyProtocolHeader(clientAddr, targetAddr net.Addr) string {
 		return "PROXY UNKNOWN\r\n"
 	}
 
-	// Determine protocol family based on client IP and normalize target IP accordingly
-	var protocol string
-	var targetIP string
-
-	if clientTCP.IP.To4() != nil {
-		// Client is IPv4, use TCP4 protocol
-		protocol = "TCP4"
-		if targetTCP.IP.To4() != nil {
-			// Target is also IPv4, use as-is
-			targetIP = targetTCP.IP.String()
-		} else {
-			// Target is IPv6, but we need IPv4 for consistent protocol family
-			// Use the IPv4 loopback if target is IPv6 loopback, otherwise use 127.0.0.1
-			if targetTCP.IP.IsLoopback() {
-				targetIP = "127.0.0.1"
-			} else {
-				// For non-loopback IPv6 targets, we could try to extract embedded IPv4
-				// or fall back to a sensible IPv4 address based on the target
-				targetIP = "127.0.0.1" // Safe fallback
-			}
-		}
-	} else {
-		// Client is IPv6, use TCP6 protocol
-		protocol = "TCP6"
-		if targetTCP.IP.To4() != nil {
-			// Target is IPv4, convert to IPv6 representation
-			targetIP = "::ffff:" + targetTCP.IP.String()
-		} else {
-			// Target is also IPv6, use as-is
-			targetIP = targetTCP.IP.String()
-		}
-	}
+	protocol, normalizedTargetIP := determineProxyProtocolAndTargetIP(clientTCP.IP, targetTCP.IP)
 
 	return fmt.Sprintf("PROXY %s %s %s %d %d\r\n",
 		protocol,
 		clientTCP.IP.String(),
-		targetIP,
+		normalizedTargetIP,
 		clientTCP.Port,
 		targetTCP.Port)
 }

@@ -103,6 +103,18 @@ func TestNewSNIProxyRequiresHTTPS(t *testing.T) {
 	}
 }
 
+func TestNewSNIProxyAcceptsHTTPSRemoteConfigURL(t *testing.T) {
+	if _, err := NewSNIProxy(8443, "https://pangolin.example.com", "", "127.0.0.1", 443, nil, false, nil); err != nil {
+		t.Fatalf("expected valid https remote config URL to be accepted: %v", err)
+	}
+}
+
+func TestNewSNIProxyAcceptsEmptyRemoteConfigURL(t *testing.T) {
+	if _, err := NewSNIProxy(8443, "", "", "127.0.0.1", 443, nil, false, nil); err != nil {
+		t.Fatalf("expected empty remote config URL to be accepted: %v", err)
+	}
+}
+
 func TestNewSNIProxyValidatesAllowedNetworks(t *testing.T) {
 	if _, err := NewSNIProxy(8443, "https://pangolin.example.com", "", "127.0.0.1", 443, nil, false, nil, "not-a-cidr"); err == nil {
 		t.Fatal("expected invalid allowed network to be rejected")

@@ -27,6 +27,22 @@ import (
 
 const relayIfname = "relay"
 
+// evictionSampleSize bounds per-eviction work when the UDP connection cap is hit.
+// We evict the oldest connection among a small sampled subset instead of scanning
+// the entire map on every eviction attempt.
+const evictionSampleSize = 64
+
+// Serializes UDP destination connection cap-check and creation to avoid
+// concurrent goroutines temporarily exceeding maxUDPConnections.
+var udpConnCreateMu sync.Mutex
+
+func releasePacketBuffer(buf []byte) {
+	if buf == nil || cap(buf) == 0 {
+		return
+	}
+	bufferPool.Put(buf[:cap(buf)])
+}
+
 const (
 	endpointCacheTTL        = 2500 * time.Millisecond
 	maxEndpointCacheEntries = 10000
@@ -224,9 +240,18 @@ func (c *endpointCache) Store(key string, entry cachedEndpointEntry) {
 		return
 	}
 	if _, exists := c.entries[key]; !exists && len(c.entries) >= c.maxEntries {
-		for evictionKey := range c.entries {
-			delete(c.entries, evictionKey)
-			break
+		var oldestKey string
+		var oldestTime time.Time
+		first := true
+		for k, v := range c.entries {
+			if first || v.cachedAt.Before(oldestTime) {
+				oldestKey = k
+				oldestTime = v.cachedAt
+				first = false
+			}
+		}
+		if !first {
+			delete(c.entries, oldestKey)
 		}
 	}
 	c.entries[key] = entry
@@ -495,7 +520,7 @@ func (s *UDPProxyServer) packetWorker() {
 			if !allowed {
 				// logger.Debug("Rate limiting hole punch message from %s", rateLimitKey)
 				metrics.RecordHolePunchEvent(relayIfname, "rate_limited")
-				bufferPool.Put(packet.data[:1500])
+				releasePacketBuffer(packet.data)
 				continue
 			}
 
@@ -1005,6 +1030,17 @@ func (s *UDPProxyServer) getOrCreateConnection(destAddr *net.UDPAddr, remoteAddr
 		return destConn.conn, nil
 	}
 
+	// Serialize cap-check + create + store to enforce maxUDPConnections under concurrency.
+	udpConnCreateMu.Lock()
+	defer udpConnCreateMu.Unlock()
+
+	// Another goroutine may have created the connection while we were waiting.
+	if conn, ok := s.connections.Load(key); ok {
+		destConn := conn.(*DestinationConn)
+		destConn.lastUsed.Store(time.Now().UnixNano())
+		return destConn.conn, nil
+	}
+
 	// Enforce a hard cap on concurrent sockets so a burst of peer churn can't
 	// exhaust the host's ephemeral ports/fds. Evict the least-recently-used
 	// connection to make room instead of growing unbounded.
@@ -1037,12 +1073,15 @@ func (s *UDPProxyServer) getOrCreateConnection(destAddr *net.UDPAddr, remoteAddr
 	return newConn, nil
 }
 
-// evictLRUConnection closes and removes the least-recently-used destination
-// connection so a new one can be created under the concurrent connection cap.
+// evictLRUConnection closes and removes an old destination connection so a new
+// one can be created under the concurrent connection cap.
+// To keep this path fast under churn, we only sample a fixed number of entries
+// and evict the oldest within that sample.
 func (s *UDPProxyServer) evictLRUConnection() {
 	var oldestKey interface{}
 	var oldestConn *DestinationConn
 	var oldestTime int64
+	sampled := 0
 
 	s.connections.Range(func(key, value interface{}) bool {
 		destConn := value.(*DestinationConn)
@@ -1052,7 +1091,8 @@ func (s *UDPProxyServer) evictLRUConnection() {
 			oldestConn = destConn
 			oldestTime = lu
 		}
-		return true
+		sampled++
+		return sampled < evictionSampleSize
 	})
 
 	if oldestKey != nil {
