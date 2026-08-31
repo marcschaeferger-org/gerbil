@@ -677,24 +677,28 @@ func main() {
 	group, groupCtx := errgroup.WithContext(ctx)
 
 	// Periodic bandwidth reporting
-	group.Go(func() error {
-		return periodicBandwidthCheck(groupCtx, controlPlaneHTTPClient, remoteConfigURL+"/gerbil/receive-bandwidth")
-	})
+	if remoteConfigURL != "" {
+		group.Go(func() error {
+			return periodicBandwidthCheck(groupCtx, controlPlaneHTTPClient, remoteConfigURL+"/gerbil/receive-bandwidth")
+		})
+	}
 
 	// Start the UDP proxy server
 	relayPort := wgconfig.RelayPort
 	if relayPort == 0 {
 		relayPort = 21820 // in case there is no relay port set, use 21820
 	}
-	proxyRelay, err = relay.NewUDPProxyServer(groupCtx, fmt.Sprintf(":%d", relayPort), remoteConfigURL, key, reachableAt, allowInsecureRemoteConfig)
-	if err != nil {
-		logger.Fatal("Failed to configure UDP proxy server: %v", err)
+	if remoteConfigURL != "" {
+		proxyRelay, err = relay.NewUDPProxyServer(groupCtx, fmt.Sprintf(":%d", relayPort), remoteConfigURL, key, reachableAt, allowInsecureRemoteConfig)
+		if err != nil {
+			logger.Fatal("Failed to configure UDP proxy server: %v", err)
+		}
+		err = proxyRelay.Start()
+		if err != nil {
+			logger.Fatal("Failed to start UDP proxy server: %v", err)
+		}
+		defer proxyRelay.Stop()
 	}
-	err = proxyRelay.Start()
-	if err != nil {
-		logger.Fatal("Failed to start UDP proxy server: %v", err)
-	}
-	defer proxyRelay.Stop()
 
 	// TODO: WE SHOULD PULL THIS OUT OF THE CONFIG OR SOMETHING
 	// 		 SO YOU DON'T NEED TO SET THIS SEPARATELY

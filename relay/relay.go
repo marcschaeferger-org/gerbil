@@ -240,6 +240,9 @@ func ValidateRemoteConfigURL(serverURL string, allowInsecureHTTP bool) error {
 	if err != nil {
 		return fmt.Errorf("invalid remote config URL: %w", err)
 	}
+	if u.Scheme == "" {
+		return fmt.Errorf("remote config URL must include a scheme (e.g. https://...)")
+	}
 	if u.Host == "" {
 		return fmt.Errorf("remote config URL must include a host")
 	}
