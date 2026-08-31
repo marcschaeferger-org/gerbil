@@ -63,7 +63,8 @@ See [docs/observability.md](docs/observability.md) for complete documentation, m
 Important:
 - `reachableAt`: How should the remote server reach Gerbil's API?
 - `generateAndSaveKeyTo`: Where to save the generated WireGuard private key to persist across restarts.
-- `remoteConfig`: Remote config location to HTTP get the JSON based config from.
+- `remoteConfig`: HTTPS remote config location used to get the JSON-based config.
+- `sni-proxy-allowed-cidrs` (optional): Comma-separated CIDRs allowed as remote SNI proxy targets. Remote targets are rejected when this is unset.
 
 Others:
 - `reportBandwidthTo` (optional): **DEPRECATED** - Use `remoteConfig` instead. Remote HTTP endpoint to send peer bandwidth data
@@ -83,9 +84,10 @@ Others:
 All CLI arguments can also be provided via environment variables:
 
 - `INTERFACE`: Name of the WireGuard interface
-- `REMOTE_CONFIG`: URL of the remote config server
+- `REMOTE_CONFIG`: HTTPS URL of the remote config server
+- `SNI_PROXY_ALLOWED_CIDRS`: Comma-separated CIDRs allowed as remote SNI proxy targets
 - `LISTEN`: Address to listen on for the HTTP server (private/loopback addresses only; wildcard and public addresses are rejected; default `127.0.0.1:3003`)
-- `CONTROL_API_TOKEN`: Bearer token for control-plane mutation endpoints (required; at least 32 characters)
+- `CONTROL_API_TOKEN`: ****** for control-plane mutation endpoints (required; at least 32 characters)
 - `GENERATE_AND_SAVE_KEY_TO`: Path to save generated private key
 - `REACHABLE_AT`: Endpoint of the HTTP server to tell remote config about
 - `LOG_LEVEL`: Log level (DEBUG, INFO, WARN, ERROR, FATAL)
@@ -106,7 +108,8 @@ Set `CONTROL_API_TOKEN` to a shared random secret and `LISTEN` to the Gerbil hos
 --listen=gerbil:3004 \
 --reachableAt=http://gerbil:3004 \
 --generateAndSaveKeyTo=/var/config/key \
---remoteConfig=http://pangolin:3001/api/v1/
+--remoteConfig=https://pangolin.example.com/api/v1/ \
+--sni-proxy-allowed-cidrs=203.0.113.0/24
 ```
 
 ```yaml
@@ -121,7 +124,8 @@ services:
     command:
       - --reachableAt=http://gerbil:3004
       - --generateAndSaveKeyTo=/var/config/key
-      - --remoteConfig=http://pangolin:3001/api/v1/
+      - --remoteConfig=https://pangolin.example.com/api/v1/
+      - --sni-proxy-allowed-cidrs=203.0.113.0/24
     volumes:
       - ./config/:/var/config
     cap_add:
