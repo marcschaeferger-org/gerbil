@@ -132,6 +132,9 @@ const pangolinHostHeader = "p-dest-host-header"
 // payloads such as base64-encoded images.
 const maxRouterRequestBodyBytes int64 = 32 << 20 // 32 MiB
 
+// maxControlRequestBodyBytes bounds JSON payloads accepted by control API handlers.
+const maxControlRequestBodyBytes int64 = 1 << 20 // 1 MiB
+
 // splitDestHeader separates an optional "scheme://" prefix from a
 // pangolinDestHeader value, defaulting to "http" when none is present.
 func splitDestHeader(dest string) (scheme, host string) {
@@ -939,6 +942,7 @@ func main() {
 	server := &http.Server{
 		Addr:              listenAddr,
 		Handler:           apiMux,
+		ReadTimeout:       30 * time.Second,
 		ReadHeaderTimeout: 3 * time.Second,
 	}
 
@@ -1565,6 +1569,7 @@ func handleHealthz(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleAddPeer(w http.ResponseWriter, r *http.Request) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxControlRequestBodyBytes)
 	var peer Peer
 	if err := json.NewDecoder(r.Body).Decode(&peer); err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -1764,6 +1769,7 @@ func handleUpdateProxyMapping(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, maxControlRequestBodyBytes)
 	var update ProxyMappingUpdate
 	if err := json.NewDecoder(r.Body).Decode(&update); err != nil {
 		logger.Error("Failed to decode request body: %v", err)
@@ -1819,6 +1825,7 @@ func handleUpdateDestinations(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, maxControlRequestBodyBytes)
 	var request UpdateDestinationsRequest
 	if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
 		logger.Error("Failed to decode request body: %v", err)
@@ -1898,6 +1905,7 @@ func handleUpdateLocalSNIs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, maxControlRequestBodyBytes)
 	var req UpdateLocalSNIsRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
