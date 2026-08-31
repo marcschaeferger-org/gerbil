@@ -11,6 +11,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
@@ -63,11 +65,25 @@ func loadMaxSNIConnectionsPerIP() int64 {
 	return defaultMaxSNIConnectionsPerIP
 }
 
+// defaultSNITunnelIdleTimeout limits how long an established tunnel can go
+// without transferring data. Overridable via GERBIL_SNI_TUNNEL_IDLE_TIMEOUT.
+const defaultSNITunnelIdleTimeout = 5 * time.Minute
+
+func loadSNITunnelIdleTimeout() time.Duration {
+	if v := os.Getenv("GERBIL_SNI_TUNNEL_IDLE_TIMEOUT"); v != "" {
+		if timeout, err := time.ParseDuration(v); err == nil && timeout > 0 {
+			return timeout
+		}
+	}
+	return defaultSNITunnelIdleTimeout
+}
+
 // RouteRecord represents a routing configuration
 type RouteRecord struct {
 	Hostname   string
 	TargetHost string
 	TargetPort int
+	remote     bool
 }
 
 // RouteAPIResponse represents the response from the route API
@@ -87,17 +103,19 @@ type ProxyProtocolInfo struct {
 
 // SNIProxy represents the main proxy server
 type SNIProxy struct {
-	port            int
-	cache           *cache.Cache
-	listener        net.Listener
-	ctx             context.Context
-	cancel          context.CancelFunc
-	wg              sync.WaitGroup
-	localProxyAddr  string
-	localProxyPort  int
-	remoteConfigURL string
-	publicKey       string
-	proxyProtocol   bool // Enable PROXY protocol v1
+	port              int
+	cache             *cache.Cache
+	listener          net.Listener
+	ctx               context.Context
+	cancel            context.CancelFunc
+	wg                sync.WaitGroup
+	localProxyAddr    string
+	localProxyPort    int
+	remoteConfigURL   string
+	publicKey         string
+	proxyProtocol     bool // Enable PROXY protocol v1
+	allowedNetworks   []netip.Prefix
+	tunnelIdleTimeout time.Duration
 
 	// New fields for fast local SNI lookup
 	localSNIs     map[string]struct{}
@@ -394,8 +412,22 @@ func buildProxyProtocolHeader(clientAddr, targetAddr net.Addr) string {
 }
 
 // NewSNIProxy creates a new SNI proxy instance
-func NewSNIProxy(port int, remoteConfigURL, publicKey, localProxyAddr string, localProxyPort int, localOverrides []string, proxyProtocol bool, trustedUpstreams []string) (*SNIProxy, error) {
+func NewSNIProxy(port int, remoteConfigURL, publicKey, localProxyAddr string, localProxyPort int, localOverrides []string, proxyProtocol bool, trustedUpstreams []string, allowedNetworks ...string) (*SNIProxy, error) {
 	ctx, cancel := context.WithCancel(context.Background())
+	if err := ValidateRemoteConfigURL(remoteConfigURL); err != nil {
+		cancel()
+		return nil, err
+	}
+
+	parsedNetworks := make([]netip.Prefix, 0, len(allowedNetworks))
+	for _, network := range allowedNetworks {
+		prefix, err := netip.ParsePrefix(network)
+		if err != nil {
+			cancel()
+			return nil, fmt.Errorf("invalid SNI proxy allowed network %q: %w", network, err)
+		}
+		parsedNetworks = append(parsedNetworks, prefix.Masked())
+	}
 
 	// Create local overrides map
 	overridesMap := make(map[string]struct{})
@@ -422,21 +454,32 @@ func NewSNIProxy(port int, remoteConfigURL, publicKey, localProxyAddr string, lo
 	}
 
 	proxy := &SNIProxy{
-		port:             port,
-		cache:            cache.New(3*time.Second, 10*time.Minute),
-		ctx:              ctx,
-		cancel:           cancel,
-		localProxyAddr:   localProxyAddr,
-		localProxyPort:   localProxyPort,
-		remoteConfigURL:  remoteConfigURL,
-		publicKey:        publicKey,
-		proxyProtocol:    proxyProtocol,
-		localSNIs:        make(map[string]struct{}),
-		localOverrides:   overridesMap,
-		activeTunnels:    make(map[string]*activeTunnel),
-		trustedUpstreams: trustedMap,
+		port:              port,
+		cache:             cache.New(3*time.Second, 10*time.Minute),
+		ctx:               ctx,
+		cancel:            cancel,
+		localProxyAddr:    localProxyAddr,
+		localProxyPort:    localProxyPort,
+		remoteConfigURL:   remoteConfigURL,
+		publicKey:         publicKey,
+		proxyProtocol:     proxyProtocol,
+		allowedNetworks:   parsedNetworks,
+		tunnelIdleTimeout: loadSNITunnelIdleTimeout(),
+		localSNIs:         make(map[string]struct{}),
+		localOverrides:    overridesMap,
+		activeTunnels:     make(map[string]*activeTunnel),
+		trustedUpstreams:  trustedMap,
 		httpClient: &http.Client{
 			Timeout: 5 * time.Second,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				if len(via) >= 10 {
+					return fmt.Errorf("route API stopped after 10 redirects")
+				}
+				if req.URL.Scheme != "https" || len(via) == 0 || req.URL.Host != via[0].URL.Host {
+					return fmt.Errorf("route API redirect must remain on the configured HTTPS origin")
+				}
+				return nil
+			},
 			Transport: &http.Transport{
 				MaxIdleConns:        100,
 				MaxIdleConnsPerHost: 10,
@@ -452,6 +495,18 @@ func NewSNIProxy(port int, remoteConfigURL, publicKey, localProxyAddr string, lo
 	}
 
 	return proxy, nil
+}
+
+// ValidateRemoteConfigURL ensures control-plane responses are authenticated.
+func ValidateRemoteConfigURL(remoteConfigURL string) error {
+	if remoteConfigURL == "" {
+		return nil
+	}
+	parsedURL, err := url.Parse(remoteConfigURL)
+	if err != nil || parsedURL.Scheme != "https" || parsedURL.Hostname() == "" {
+		return fmt.Errorf("remote config URL must use authenticated HTTPS")
+	}
+	return nil
 }
 
 // Start begins listening for connections
@@ -680,10 +735,8 @@ func (p *SNIProxy) handleConnection(clientConn net.Conn) {
 
 	logger.Debug("Routing %s to %s:%d", hostname, route.TargetHost, route.TargetPort)
 
-	// Connect to target server
-	targetConn, err := net.DialTimeout("tcp",
-		fmt.Sprintf("%s:%d", route.TargetHost, route.TargetPort),
-		10*time.Second)
+	// Resolve, validate, and connect to the target immediately before use.
+	targetConn, err := p.dialRoute(route)
 	if err != nil {
 		logger.Debug("Failed to connect to target %s:%d: %v",
 			route.TargetHost, route.TargetPort, err)
@@ -744,6 +797,47 @@ func (p *SNIProxy) handleConnection(clientConn net.Conn) {
 
 	// Start bidirectional data transfer
 	p.pipe(hostname, actualClientConn, targetConn, clientReader)
+}
+
+func (p *SNIProxy) dialRoute(route *RouteRecord) (net.Conn, error) {
+	ctx, cancel := context.WithTimeout(p.ctx, 10*time.Second)
+	defer cancel()
+
+	dialer := &net.Dialer{}
+	if !route.remote {
+		return dialer.DialContext(ctx, "tcp", net.JoinHostPort(route.TargetHost, strconv.Itoa(route.TargetPort)))
+	}
+
+	resolved, err := net.DefaultResolver.LookupNetIP(ctx, "ip", route.TargetHost)
+	if err != nil {
+		return nil, fmt.Errorf("failed to resolve route target %q: %w", route.TargetHost, err)
+	}
+	if len(resolved) == 0 {
+		return nil, fmt.Errorf("route target %q resolved to no addresses", route.TargetHost)
+	}
+
+	for _, ip := range resolved {
+		allowed := false
+		for _, network := range p.allowedNetworks {
+			if network.Contains(ip.Unmap()) {
+				allowed = true
+				break
+			}
+		}
+		if !allowed {
+			return nil, fmt.Errorf("route target %q resolved outside the SNI proxy allowed networks", route.TargetHost)
+		}
+	}
+
+	var dialErr error
+	for _, ip := range resolved {
+		conn, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(ip.String(), strconv.Itoa(route.TargetPort)))
+		if err == nil {
+			return conn, nil
+		}
+		dialErr = err
+	}
+	return nil, fmt.Errorf("failed to connect to route target %q: %w", route.TargetHost, dialErr)
 }
 
 // getRoute retrieves routing information for a hostname
@@ -862,6 +956,7 @@ func (p *SNIProxy) getRoute(hostname, clientAddr string) (*RouteRecord, error) {
 		Hostname:   hostname,
 		TargetHost: targetHost,
 		TargetPort: targetPort,
+		remote:     len(endpoints) > 0,
 	}
 
 	// Cache the result
@@ -906,6 +1001,40 @@ type bufferedWriter struct {
 	io.Writer
 }
 
+type tunnelIdleDeadline struct {
+	mu      sync.Mutex
+	timeout time.Duration
+	conns   [2]net.Conn
+}
+
+func (d *tunnelIdleDeadline) refresh() error {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	deadline := time.Now().Add(d.timeout)
+	for _, conn := range d.conns {
+		if err := conn.SetDeadline(deadline); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+type idleDeadlineReader struct {
+	reader  io.Reader
+	refresh func() error
+}
+
+func (r idleDeadlineReader) Read(buf []byte) (int, error) {
+	n, err := r.reader.Read(buf)
+	if n > 0 && err == nil {
+		if refreshErr := r.refresh(); refreshErr != nil {
+			return n, refreshErr
+		}
+	}
+	return n, err
+}
+
 // pipe handles bidirectional data transfer between connections
 func (p *SNIProxy) pipe(hostname string, clientConn, targetConn net.Conn, clientReader io.Reader) {
 	var wg sync.WaitGroup
@@ -921,6 +1050,16 @@ func (p *SNIProxy) pipe(hostname string, clientConn, targetConn net.Conn, client
 		})
 	}
 
+	idleDeadline := &tunnelIdleDeadline{
+		timeout: p.tunnelIdleTimeout,
+		conns:   [2]net.Conn{clientConn, targetConn},
+	}
+	if err := idleDeadline.refresh(); err != nil {
+		logger.Debug("Failed to set tunnel idle deadline: %v", err)
+		closeConns()
+		return
+	}
+
 	// Copy data from client to target (using the buffered reader)
 	go func() {
 		defer wg.Done()
@@ -934,7 +1073,8 @@ func (p *SNIProxy) pipe(hostname string, clientConn, targetConn net.Conn, client
 			p.bufferPool.Put(bufPtr)
 		}()
 
-		bytesCopied, err := io.CopyBuffer(bufferedWriter{targetConn}, bufferedReader{clientReader}, *bufPtr)
+		reader := idleDeadlineReader{reader: clientReader, refresh: idleDeadline.refresh}
+		bytesCopied, err := io.CopyBuffer(bufferedWriter{targetConn}, bufferedReader{reader}, *bufPtr)
 		metrics.RecordProxyBytesTransmitted("client_to_target", bytesCopied)
 		if err != nil && err != io.EOF {
 			logger.Debug("Copy client->target error: %v", err)
@@ -954,7 +1094,8 @@ func (p *SNIProxy) pipe(hostname string, clientConn, targetConn net.Conn, client
 			p.bufferPool.Put(bufPtr)
 		}()
 
-		bytesCopied, err := io.CopyBuffer(bufferedWriter{clientConn}, bufferedReader{targetConn}, *bufPtr)
+		reader := idleDeadlineReader{reader: targetConn, refresh: idleDeadline.refresh}
+		bytesCopied, err := io.CopyBuffer(bufferedWriter{clientConn}, bufferedReader{reader}, *bufPtr)
 		metrics.RecordProxyBytesTransmitted("target_to_client", bytesCopied)
 		if err != nil && err != io.EOF {
 			logger.Debug("Copy target->client error: %v", err)

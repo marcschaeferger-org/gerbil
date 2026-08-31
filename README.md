@@ -63,12 +63,14 @@ See [docs/observability.md](docs/observability.md) for complete documentation, m
 Important:
 - `reachableAt`: How should the remote server reach Gerbil's API?
 - `generateAndSaveKeyTo`: Where to save the generated WireGuard private key to persist across restarts.
-- `remoteConfig`: Remote config location to HTTP get the JSON based config from.
+- `remoteConfig`: HTTPS endpoint used to retrieve the JSON configuration.
+- `remote-config-signing-key`: Base64-encoded Ed25519 public key used to verify remote configuration responses.
+- `sni-proxy-allowed-cidrs` (optional): Comma-separated CIDRs allowed as remote SNI proxy targets. Remote targets are rejected when this is unset.
 
 Others:
 - `reportBandwidthTo` (optional): **DEPRECATED** - Use `remoteConfig` instead. Remote HTTP endpoint to send peer bandwidth data
 - `interface` (optional): Name of the WireGuard interface created by Gerbil. Default: `wg0`
-- `listen` (optional): Port to listen on for HTTP server. Default: `:3004`
+- `listen` (optional): Private address and port to listen on for the HTTP server. Wildcard and public addresses are rejected. Default: `127.0.0.1:3003`
 - `log-level` (optional): The log level to use (DEBUG, INFO, WARN, ERROR, FATAL). Default: `INFO`
 - `mtu` (optional): MTU of the WireGuard interface. Default: `1280`
 - `notify` (optional): URL to notify on peer changes
@@ -84,7 +86,11 @@ All CLI arguments can also be provided via environment variables:
 
 - `INTERFACE`: Name of the WireGuard interface
 - `REMOTE_CONFIG`: URL of the remote config server
-- `LISTEN`: Address to listen on for HTTP server
+- `REMOTE_CONFIG_SIGNING_KEY`: Base64-encoded Ed25519 public key used to verify the signature in the `X-Gerbil-Config-Signature` response header. The signature must cover the exact response body.
+- `SNI_PROXY_ALLOWED_CIDRS`: Comma-separated CIDRs allowed as remote SNI proxy targets
+- `GERBIL_SNI_TUNNEL_IDLE_TIMEOUT`: Maximum time an established SNI tunnel may remain idle. Default: `5m`
+- `LISTEN`: Address to listen on for the HTTP server (private/loopback addresses only; wildcard and public addresses are rejected; default `127.0.0.1:3003`)
+- `CONTROL_API_TOKEN`: ****** for control-plane mutation endpoints (required; at least 32 characters)
 - `GENERATE_AND_SAVE_KEY_TO`: Path to save generated private key
 - `REACHABLE_AT`: Endpoint of the HTTP server to tell remote config about
 - `LOG_LEVEL`: Log level (DEBUG, INFO, WARN, ERROR, FATAL)
@@ -98,11 +104,16 @@ All CLI arguments can also be provided via environment variables:
 
 Example:
 
+Set `CONTROL_API_TOKEN` to a shared random secret and `LISTEN` to the Gerbil host's private interface before starting the service. Callers must send the token as `Authorization: Bearer <token>` on control-plane mutation requests.
+
 ```bash
 ./gerbil \
+--listen=gerbil:3004 \
 --reachableAt=http://gerbil:3004 \
 --generateAndSaveKeyTo=/var/config/key \
---remoteConfig=http://pangolin:3001/api/v1/
+--remoteConfig=https://pangolin:3001/api/v1/ \
+--remote-config-signing-key=${REMOTE_CONFIG_SIGNING_KEY} \
+--sni-proxy-allowed-cidrs=203.0.113.0/24
 ```
 
 ```yaml
@@ -111,10 +122,15 @@ services:
     image: fosrl/gerbil
     container_name: gerbil
     restart: unless-stopped
+    environment:
+      LISTEN: gerbil:3004
+      CONTROL_API_TOKEN: ${CONTROL_API_TOKEN}
+      REMOTE_CONFIG_SIGNING_KEY: ${REMOTE_CONFIG_SIGNING_KEY}
     command:
       - --reachableAt=http://gerbil:3004
       - --generateAndSaveKeyTo=/var/config/key
-      - --remoteConfig=http://pangolin:3001/api/v1/
+      - --remoteConfig=https://pangolin:3001/api/v1/
+      - --sni-proxy-allowed-cidrs=203.0.113.0/24
     volumes:
       - ./config/:/var/config
     cap_add:

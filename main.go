@@ -3,7 +3,11 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/sha256"
+	"crypto/subtle"
 	"crypto/tls"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -14,6 +18,7 @@ import (
 	"net/http"
 	"net/http/httputil"
 	httppprof "net/http/pprof"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -50,7 +55,10 @@ var (
 	bandwidthLimit   string
 	ifbName          string // IFB device name for ingress traffic shaping
 	disableFirewall  bool
+	controlAPIToken  string
 )
+
+const remoteConfigSignatureHeader = "X-Gerbil-Config-Signature"
 
 type WgConfig struct {
 	PrivateKey string `json:"privateKey"`
@@ -120,6 +128,10 @@ const pangolinDestHeader = "p-dest-header"
 // as before.
 const pangolinHostHeader = "p-dest-host-header"
 
+// maxRouterRequestBodyBytes bounds proxied AI API requests while allowing
+// payloads such as base64-encoded images.
+const maxRouterRequestBodyBytes int64 = 32 << 20 // 32 MiB
+
 // splitDestHeader separates an optional "scheme://" prefix from a
 // pangolinDestHeader value, defaulting to "http" when none is present.
 func splitDestHeader(dest string) (scheme, host string) {
@@ -137,6 +149,173 @@ func hostname(hostport string) string {
 	return hostport
 }
 
+func validateRouterDestination(dest string) error {
+	scheme, hostport := splitDestHeader(dest)
+	if scheme != "http" && scheme != "https" {
+		return fmt.Errorf("unsupported destination scheme %q", scheme)
+	}
+
+	host, portString, err := net.SplitHostPort(hostport)
+	if err != nil || host == "" {
+		return errors.New("invalid destination address")
+	}
+	port, err := strconv.Atoi(portString)
+	if err != nil || port < 1 || port > 65535 {
+		return errors.New("invalid destination port")
+	}
+	return nil
+}
+
+func routerAllowedNetworks() ([]net.IPNet, error) {
+	wgMu.Lock()
+	defer wgMu.Unlock()
+
+	if wgClient == nil {
+		return nil, errors.New("WireGuard client is not initialized")
+	}
+	device, err := wgClient.Device(interfaceName)
+	if err != nil {
+		return nil, fmt.Errorf("read WireGuard peers: %w", err)
+	}
+
+	var networks []net.IPNet
+	for _, peer := range device.Peers {
+		networks = append(networks, peer.AllowedIPs...)
+	}
+	return networks, nil
+}
+
+type routerCIDRNode struct {
+	children       [2]*routerCIDRNode
+	networkIndexes []int
+}
+
+func routerCIDRCovered(node *routerCIDRNode) bool {
+	if node == nil {
+		return false
+	}
+	if len(node.networkIndexes) != 0 {
+		return true
+	}
+	return routerCIDRCovered(node.children[0]) && routerCIDRCovered(node.children[1])
+}
+
+func markRouterCIDRCover(node *routerCIDRNode, blocked map[int]struct{}) {
+	if len(node.networkIndexes) != 0 {
+		for _, index := range node.networkIndexes {
+			blocked[index] = struct{}{}
+		}
+		return
+	}
+	markRouterCIDRCover(node.children[0], blocked)
+	markRouterCIDRCover(node.children[1], blocked)
+}
+
+func unrestrictedRouterNetworks(networks []net.IPNet) map[int]struct{} {
+	blocked := make(map[int]struct{})
+	for {
+		roots := map[int]*routerCIDRNode{
+			net.IPv4len * 8: {},
+			net.IPv6len * 8: {},
+		}
+		for index, network := range networks {
+			if _, skip := blocked[index]; skip {
+				continue
+			}
+			ones, bits := network.Mask.Size()
+			ip := network.IP
+			if bits == net.IPv4len*8 {
+				ip = ip.To4()
+			} else if bits == net.IPv6len*8 {
+				ip = ip.To16()
+			} else {
+				continue
+			}
+
+			node := roots[bits]
+			for bit := 0; bit < ones; bit++ {
+				direction := (ip[bit/8] >> (7 - bit%8)) & 1
+				if node.children[direction] == nil {
+					node.children[direction] = &routerCIDRNode{}
+				}
+				node = node.children[direction]
+			}
+			node.networkIndexes = append(node.networkIndexes, index)
+		}
+
+		changed := false
+		for _, root := range roots {
+			if routerCIDRCovered(root) {
+				markRouterCIDRCover(root, blocked)
+				changed = true
+			}
+		}
+		if !changed {
+			return blocked
+		}
+	}
+}
+
+func routerIPAllowed(ip net.IP, networks []net.IPNet) bool {
+	if ip == nil || !ip.IsGlobalUnicast() {
+		return false
+	}
+	unrestricted := unrestrictedRouterNetworks(networks)
+	for index, network := range networks {
+		if _, blocked := unrestricted[index]; !blocked && network.Contains(ip) {
+			return true
+		}
+	}
+	return false
+}
+
+// dialRouterContext resolves once, verifies every answer against the configured
+// WireGuard peer networks, and dials a verified numeric IP to prevent DNS
+// rebinding between validation and connection establishment.
+func dialRouterContext(ctx context.Context, network, addr string) (net.Conn, error) {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return nil, fmt.Errorf("invalid router address: %w", err)
+	}
+	resolved, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+	if err != nil {
+		return nil, fmt.Errorf("resolve router destination: %w", err)
+	}
+	if len(resolved) == 0 {
+		return nil, errors.New("router destination resolved to no addresses")
+	}
+	allowedNetworks, err := routerAllowedNetworks()
+	if err != nil {
+		return nil, err
+	}
+	for _, candidate := range resolved {
+		if !routerIPAllowed(candidate.IP, allowedNetworks) {
+			return nil, fmt.Errorf("router destination resolved to disallowed address %s", candidate.IP)
+		}
+	}
+
+dialer := &net.Dialer{
+		Control: func(_, _ string, conn syscall.RawConn) error {
+			var socketErr error
+			if err := conn.Control(func(fd uintptr) {
+				socketErr = syscall.SetsockoptString(int(fd), syscall.SOL_SOCKET, syscall.SO_BINDTODEVICE, interfaceName)
+			}); err != nil {
+				return err
+			}
+			return socketErr
+		},
+	}
+	var dialErrors []error
+	for _, candidate := range resolved {
+		conn, err := dialer.DialContext(ctx, network, net.JoinHostPort(candidate.String(), port))
+		if err == nil {
+			return conn, nil
+		}
+		dialErrors = append(dialErrors, err)
+	}
+	return nil, errors.Join(dialErrors...)
+}
+
 // routerSNIContextKey carries the TLS ServerName (SNI) that
 // routerTransport's DialTLSContext should present, since we dial the
 // WireGuard destination IP but the remote end typically terminates TLS
@@ -149,43 +328,23 @@ type routerSNIContextKey struct{}
 // (the WireGuard IP), which the destination's TLS termination won't have a
 // matching certificate/route for.
 var routerTransport = &http.Transport{
-	Proxy: http.ProxyFromEnvironment,
+	DialContext: dialRouterContext,
 	DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 		serverName := hostname(addr)
 		if sni, ok := ctx.Value(routerSNIContextKey{}).(string); ok && sni != "" {
 			serverName = sni
 		}
-		dialer := &tls.Dialer{Config: &tls.Config{ServerName: serverName}}
-		return dialer.DialContext(ctx, network, addr)
-	},
-}
-
-// logDebugRequest dumps a request's destination, headers, and body at debug
-// level for troubleshooting (e.g. verifying an auth header made it through
-// the proxy chain intact). It reads and restores req.Body so the request can
-// still be sent afterward. Header values (including secrets like API keys)
-// are logged as-is - only intended to be enabled for local troubleshooting.
-func logDebugRequest(label string, req *http.Request) {
-	var headerLines strings.Builder
-	for name, values := range req.Header {
-		for _, v := range values {
-			fmt.Fprintf(&headerLines, "\n  %s: %s", name, v)
-		}
-	}
-
-	body := []byte("<empty>")
-	if req.Body != nil {
-		data, err := io.ReadAll(req.Body)
-		req.Body.Close()
+		conn, err := dialRouterContext(ctx, network, addr)
 		if err != nil {
-			logger.Error("%s: failed to read body for logging: %v", label, err)
-		} else {
-			body = data
+			return nil, err
 		}
-		req.Body = io.NopCloser(bytes.NewReader(data))
-	}
-
-	logger.Debug("%s: %s %s://%s%s headers:%s\nbody: %s", label, req.Method, req.URL.Scheme, req.Host, req.URL.RequestURI(), headerLines.String(), body)
+		tlsConn := tls.Client(conn, &tls.Config{ServerName: serverName})
+		if err := tlsConn.HandshakeContext(ctx); err != nil {
+			_ = conn.Close()
+			return nil, err
+		}
+		return tlsConn, nil
+	},
 }
 
 // routerProxy forwards /router/* requests from the Pangolin AI gateway to a
@@ -213,8 +372,7 @@ var routerProxy = &httputil.ReverseProxy{
 		pr.Out.Header.Del(pangolinDestHeader)
 		pr.Out.Header.Del(pangolinHostHeader)
 
-		logger.Debug("Router proxy: %s %s -> %s (Host: %s)", pr.In.Method, pr.In.URL.Path, pr.Out.URL.String(), pr.Out.Host)
-		logDebugRequest("Router outbound request", pr.Out)
+		logger.Debug("Router proxy: %s %s -> %s://%s%s (Host: %s)", pr.In.Method, pr.In.URL.Path, pr.Out.URL.Scheme, pr.Out.URL.Host, pr.Out.URL.EscapedPath(), pr.Out.Host)
 	},
 	Transport: routerTransport,
 	// Flush written bytes to the client immediately rather than buffering,
@@ -235,10 +393,16 @@ func handleRouter(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, fmt.Sprintf("Missing %s header", pangolinDestHeader), http.StatusBadRequest)
 		return
 	}
-	_, host := splitDestHeader(dest)
-	if _, _, err := net.SplitHostPort(host); err != nil {
+	if err := validateRouterDestination(dest); err != nil {
 		http.Error(w, "Invalid destination", http.StatusBadRequest)
 		return
+	}
+	if r.ContentLength > maxRouterRequestBodyBytes {
+		http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+		return
+	}
+	if r.Body != nil {
+		r.Body = http.MaxBytesReader(w, r.Body, maxRouterRequestBodyBytes)
 	}
 
 	routerProxy.ServeHTTP(w, r)
@@ -306,6 +470,7 @@ func main() {
 		wgconfig             WgConfig
 		configFile           string
 		remoteConfigURL      string
+		remoteConfigKey      string
 		generateAndSaveKeyTo string
 		reachableAt          string
 		logLevel             string
@@ -315,6 +480,7 @@ func main() {
 		localProxyPort       int
 		localOverridesStr    string
 		trustedUpstreamsStr  string
+		proxyAllowedCIDRsStr string
 		proxyProtocol        bool
 
 		// Metrics configuration variables (set from env, then overridden by CLI flags)
@@ -331,18 +497,21 @@ func main() {
 	interfaceName = os.Getenv("INTERFACE")
 	configFile = os.Getenv("CONFIG")
 	remoteConfigURL = os.Getenv("REMOTE_CONFIG")
+	remoteConfigKey = os.Getenv("REMOTE_CONFIG_SIGNING_KEY")
 	listenAddr = os.Getenv("LISTEN")
 	generateAndSaveKeyTo = os.Getenv("GENERATE_AND_SAVE_KEY_TO")
 	reachableAt = os.Getenv("REACHABLE_AT")
 	logLevel = os.Getenv("LOG_LEVEL")
 	mtu = os.Getenv("MTU")
 	notifyURL = os.Getenv("NOTIFY_URL")
+	controlAPIToken = os.Getenv("CONTROL_API_TOKEN")
 
 	sniProxyPortStr := os.Getenv("SNI_PORT")
 	localProxyAddr = os.Getenv("LOCAL_PROXY")
 	localProxyPortStr := os.Getenv("LOCAL_PROXY_PORT")
 	localOverridesStr = os.Getenv("LOCAL_OVERRIDES")
 	trustedUpstreamsStr = os.Getenv("TRUSTED_UPSTREAMS")
+	proxyAllowedCIDRsStr = os.Getenv("SNI_PROXY_ALLOWED_CIDRS")
 	proxyProtocolStr := os.Getenv("PROXY_PROTOCOL")
 	doTrafficShapingStr := os.Getenv("DO_TRAFFIC_SHAPING")
 	bandwidthLimitStr := os.Getenv("BANDWIDTH_LIMIT")
@@ -399,6 +568,9 @@ func main() {
 	if remoteConfigURL == "" {
 		flag.StringVar(&remoteConfigURL, "remoteConfig", "", "URL of the Pangolin server")
 	}
+	if remoteConfigKey == "" {
+		flag.StringVar(&remoteConfigKey, "remote-config-signing-key", "", "Base64-encoded Ed25519 public key for remote config verification")
+	}
 	if listenAddr == "" {
 		flag.StringVar(&listenAddr, "listen", "", "DEPRECATED (overridden by reachableAt): Address to listen on")
 	}
@@ -452,6 +624,9 @@ func main() {
 	if trustedUpstreamsStr == "" {
 		flag.StringVar(&trustedUpstreamsStr, "trusted-upstreams", "", "Comma-separated list of trusted upstream proxy domain names/IPs that can send PROXY protocol")
 	}
+	if proxyAllowedCIDRsStr == "" {
+		flag.StringVar(&proxyAllowedCIDRsStr, "sni-proxy-allowed-cidrs", "", "Comma-separated CIDRs allowed as remote SNI proxy targets")
+	}
 
 	if proxyProtocolStr != "" {
 		proxyProtocol = strings.ToLower(proxyProtocolStr) == "true"
@@ -490,8 +665,10 @@ func main() {
 	flag.BoolVar(&otelMetricsInsecure, "otel-metrics-insecure", otelMetricsInsecure, "Disable TLS for OTLP connection")
 	flag.DurationVar(&otelMetricsExportInterval, "otel-metrics-export-interval", otelMetricsExportInterval, "Interval between OTLP metric pushes")
 	flag.DurationVar(&otelMetricsTimeout, "otel-metrics-timeout", otelMetricsTimeout, "Timeout for OTLP exporter setup")
-
 	flag.Parse()
+	if err := proxy.ValidateRemoteConfigURL(remoteConfigURL); err != nil {
+		log.Fatal(err)
+	}
 
 	// Heap profiles are dumped into the configured config directory (the same
 	// directory as the config file, or /var/config as a fallback for remote-config
@@ -548,20 +725,21 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	// try to parse as http://host:port and set the listenAddr to the :port from this reachableAt.
+	// Bind to the concrete host advertised by reachableAt when LISTEN is not set.
 	if reachableAt != "" && listenAddr == "" {
-		if strings.HasPrefix(reachableAt, "http://") || strings.HasPrefix(reachableAt, "https://") {
-			parts := strings.Split(reachableAt, ":")
-			if len(parts) == 3 {
-				port := parts[2]
-				if strings.Contains(port, "/") {
-					port = strings.Split(port, "/")[0]
-				}
-				listenAddr = ":" + port
-			}
+		advertisedURL, parseErr := url.Parse(reachableAt)
+		if parseErr != nil || (advertisedURL.Scheme != "http" && advertisedURL.Scheme != "https") ||
+			advertisedURL.Hostname() == "" || advertisedURL.Port() == "" {
+			logger.Fatal("--reachableAt / REACHABLE_AT must be an HTTP(S) URL with an explicit port, or --listen / LISTEN must be set")
 		}
-	} else if listenAddr == "" {
-		listenAddr = ":3003"
+		listenAddr = net.JoinHostPort(advertisedURL.Hostname(), advertisedURL.Port())
+	}
+	if listenAddr == "" {
+		listenAddr = "127.0.0.1:3003"
+	}
+
+	if len(controlAPIToken) < 32 {
+		logger.Fatal("CONTROL_API_TOKEN must be set to a secret of at least 32 characters")
 	}
 
 	mtuInt, err = strconv.Atoi(mtu)
@@ -579,33 +757,30 @@ func main() {
 		logger.Fatal("You must provide either a config file or a remote config URL, not both")
 	}
 
+	var remoteConfigSigningKey ed25519.PublicKey
+	if remoteConfigURL != "" {
+		remoteConfigSigningKey, err = parseRemoteConfigSigningKey(remoteConfigKey)
+		if err != nil {
+			logger.Fatal("Invalid remote config signing key: %v", err)
+		}
+	}
+
 	// clean up the reomte config URL for backwards compatibility
 	remoteConfigURL = strings.TrimSuffix(remoteConfigURL, "/gerbil/get-config")
 	remoteConfigURL = strings.TrimSuffix(remoteConfigURL, "/")
+	if remoteConfigURL != "" {
+		if err := relay.ValidateRemoteConfigURL(remoteConfigURL); err != nil {
+			logger.Fatal("Invalid remote config URL: %v", err)
+		}
+	}
+	controlPlaneHTTPClient := relay.NewControlPlaneHTTPClient()
 
 	var key wgtypes.Key
 	// if generateAndSaveKeyTo is provided, generate a private key and save it to the file. if the file already exists, load the key from the file
 	if generateAndSaveKeyTo != "" {
-		if _, err := os.Stat(generateAndSaveKeyTo); os.IsNotExist(err) {
-			// generate a new private key
-			key, err = wgtypes.GeneratePrivateKey()
-			if err != nil {
-				logger.Fatal("Failed to generate private key: %v", err)
-			}
-			// save the key to the file
-			err = os.WriteFile(generateAndSaveKeyTo, []byte(key.String()), 0644)
-			if err != nil {
-				logger.Fatal("Failed to save private key: %v", err)
-			}
-		} else {
-			keyData, err := os.ReadFile(generateAndSaveKeyTo)
-			if err != nil {
-				logger.Fatal("Failed to read private key: %v", err)
-			}
-			key, err = wgtypes.ParseKey(string(keyData))
-			if err != nil {
-				logger.Fatal("Failed to parse private key: %v", err)
-			}
+		key, err = loadOrGeneratePrivateKey(generateAndSaveKeyTo)
+		if err != nil {
+			logger.Fatal("Failed to load or generate private key: %v", err)
 		}
 	} else {
 		// if no generateAndSaveKeyTo is provided, ensure that the private key is provided
@@ -631,8 +806,11 @@ func main() {
 		// loop until we get the config
 		for wgconfig.PrivateKey == "" {
 			logger.Info("Fetching remote config from %s", remoteConfigURL+"/gerbil/get-config")
-			wgconfig, err = loadRemoteConfig(remoteConfigURL+"/gerbil/get-config", key, reachableAt)
+			wgconfig, err = loadRemoteConfig(ctx, controlPlaneHTTPClient, remoteConfigURL+"/gerbil/get-config", key, reachableAt, remoteConfigSigningKey)
 			if err != nil {
+				if ctx.Err() != nil {
+					return
+				}
 				logger.Error("Failed to load configuration: %v", err)
 				time.Sleep(5 * time.Second)
 				continue
@@ -666,21 +844,28 @@ func main() {
 	group, groupCtx := errgroup.WithContext(ctx)
 
 	// Periodic bandwidth reporting
-	group.Go(func() error {
-		return periodicBandwidthCheck(groupCtx, remoteConfigURL+"/gerbil/receive-bandwidth")
-	})
+	if remoteConfigURL != "" {
+		group.Go(func() error {
+			return periodicBandwidthCheck(groupCtx, controlPlaneHTTPClient, remoteConfigURL+"/gerbil/receive-bandwidth")
+		})
+	}
 
 	// Start the UDP proxy server
 	relayPort := wgconfig.RelayPort
 	if relayPort == 0 {
 		relayPort = 21820 // in case there is no relay port set, use 21820
 	}
-	proxyRelay = relay.NewUDPProxyServer(groupCtx, fmt.Sprintf(":%d", relayPort), remoteConfigURL, key, reachableAt)
-	err = proxyRelay.Start()
-	if err != nil {
-		logger.Fatal("Failed to start UDP proxy server: %v", err)
+	if remoteConfigURL != "" {
+		proxyRelay, err = relay.NewUDPProxyServer(groupCtx, fmt.Sprintf(":%d", relayPort), remoteConfigURL, key, reachableAt)
+		if err != nil {
+			logger.Fatal("Failed to configure UDP proxy server: %v", err)
+		}
+		err = proxyRelay.Start()
+		if err != nil {
+			logger.Fatal("Failed to start UDP proxy server: %v", err)
+		}
+		defer proxyRelay.Stop()
 	}
-	defer proxyRelay.Stop()
 
 	// TODO: WE SHOULD PULL THIS OUT OF THE CONFIG OR SOMETHING
 	// 		 SO YOU DON'T NEED TO SET THIS SEPARATELY
@@ -703,7 +888,15 @@ func main() {
 		logger.Info("Trusted upstreams configured: %v", trustedUpstreams)
 	}
 
-	proxySNI, err = proxy.NewSNIProxy(sniProxyPort, remoteConfigURL, key.PublicKey().String(), localProxyAddr, localProxyPort, localOverrides, proxyProtocol, trustedUpstreams)
+	var proxyAllowedCIDRs []string
+	if proxyAllowedCIDRsStr != "" {
+		proxyAllowedCIDRs = strings.Split(proxyAllowedCIDRsStr, ",")
+		for i, network := range proxyAllowedCIDRs {
+			proxyAllowedCIDRs[i] = strings.TrimSpace(network)
+		}
+	}
+
+	proxySNI, err = proxy.NewSNIProxy(sniProxyPort, remoteConfigURL, key.PublicKey().String(), localProxyAddr, localProxyPort, localOverrides, proxyProtocol, trustedUpstreams, proxyAllowedCIDRs...)
 	if err != nil {
 		logger.Fatal("Failed to create proxy: %v", err)
 	}
@@ -714,10 +907,10 @@ func main() {
 
 	// Set up HTTP server with metrics middleware
 	apiMux := http.NewServeMux()
-	apiMux.HandleFunc("/peer", httpMetricsMiddleware("peer", handlePeer))
-	apiMux.HandleFunc("/update-proxy-mapping", httpMetricsMiddleware("update_proxy_mapping", handleUpdateProxyMapping))
-	apiMux.HandleFunc("/update-destinations", httpMetricsMiddleware("update_destinations", handleUpdateDestinations))
-	apiMux.HandleFunc("/update-local-snis", httpMetricsMiddleware("update_local_snis", handleUpdateLocalSNIs))
+	apiMux.Handle("/peer", requireControlAuth(httpMetricsMiddleware("peer", handlePeer)))
+	apiMux.Handle("/update-proxy-mapping", requireControlAuth(httpMetricsMiddleware("update_proxy_mapping", handleUpdateProxyMapping)))
+	apiMux.Handle("/update-destinations", requireControlAuth(httpMetricsMiddleware("update_destinations", handleUpdateDestinations)))
+	apiMux.Handle("/update-local-snis", requireControlAuth(httpMetricsMiddleware("update_local_snis", handleUpdateLocalSNIs)))
 	apiMux.HandleFunc("/healthz", httpMetricsMiddleware("healthz", handleHealthz))
 	apiMux.HandleFunc("/router/", httpMetricsMiddleware("router", handleRouter))
 
@@ -730,7 +923,17 @@ func main() {
 		logger.Info("Metrics endpoint enabled at %s", metricsPath)
 	}
 
-	logger.Info("Starting HTTP server on %s", listenAddr)
+	listener, err := net.Listen("tcp", listenAddr)
+	if err != nil {
+		logger.Fatal("Failed to listen on %s: %v", listenAddr, err)
+	}
+	listenerIP := listener.Addr().(*net.TCPAddr).IP
+	if !listenerIP.IsLoopback() && !listenerIP.IsPrivate() {
+		_ = listener.Close()
+		logger.Fatal("Refusing to expose the control plane on non-private address %s", listenerIP)
+	}
+
+	logger.Info("Starting HTTP server on %s", listener.Addr())
 
 	// HTTP server with graceful shutdown on context cancel
 	server := &http.Server{
@@ -755,7 +958,7 @@ func main() {
 
 	group.Go(func() error {
 		// http.ErrServerClosed is returned on graceful shutdown; not an error for us
-		if err := server.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			return err
 		}
 		return nil
@@ -790,14 +993,89 @@ func main() {
 	}
 }
 
-func loadRemoteConfig(url string, key wgtypes.Key, reachableAt string) (WgConfig, error) {
+func loadOrGeneratePrivateKey(path string) (wgtypes.Key, error) {
+	keyFile, err := os.Open(path)
+	if err == nil {
+		defer keyFile.Close()
+
+		fileInfo, err := keyFile.Stat()
+		if err != nil {
+			return wgtypes.Key{}, fmt.Errorf("failed to inspect private key file: %w", err)
+		}
+		if fileInfo.Mode().Perm()&0077 != 0 {
+			return wgtypes.Key{}, fmt.Errorf("private key file has insecure permissions %04o", fileInfo.Mode().Perm())
+		}
+
+		keyData, err := io.ReadAll(keyFile)
+		if err != nil {
+			return wgtypes.Key{}, fmt.Errorf("failed to read private key: %w", err)
+		}
+		key, err := wgtypes.ParseKey(string(keyData))
+		if err != nil {
+			return wgtypes.Key{}, fmt.Errorf("failed to parse private key: %w", err)
+		}
+		return key, nil
+	}
+	if !errors.Is(err, os.ErrNotExist) {
+		return wgtypes.Key{}, fmt.Errorf("failed to open private key file: %w", err)
+	}
+
+	key, err := wgtypes.GeneratePrivateKey()
+	if err != nil {
+		return wgtypes.Key{}, fmt.Errorf("failed to generate private key: %w", err)
+	}
+	keyFile, err = os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return wgtypes.Key{}, fmt.Errorf("failed to create private key file: %w", err)
+	}
+	if _, err := io.WriteString(keyFile, key.String()); err != nil {
+		if closeErr := keyFile.Close(); closeErr != nil {
+			return wgtypes.Key{}, fmt.Errorf("failed to write private key: %v; additionally failed to close private key file: %w", err, closeErr)
+		}
+		return wgtypes.Key{}, fmt.Errorf("failed to write private key: %w", err)
+	}
+	if err := keyFile.Close(); err != nil {
+		return wgtypes.Key{}, fmt.Errorf("failed to close private key file: %w", err)
+	}
+	return key, nil
+}
+
+func parseRemoteConfigSigningKey(encoded string) (ed25519.PublicKey, error) {
+	if encoded == "" {
+		return nil, fmt.Errorf("REMOTE_CONFIG_SIGNING_KEY (or --remote-config-signing-key) is required with REMOTE_CONFIG")
+	}
+	key, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil, fmt.Errorf("must be valid base64: %w", err)
+	}
+	if len(key) != ed25519.PublicKeySize {
+		return nil, fmt.Errorf("must decode to %d bytes", ed25519.PublicKeySize)
+	}
+	return ed25519.PublicKey(key), nil
+}
+
+const remoteConfigMaxBodyBytes = 1 << 20 // 1 MiB
+
+func loadRemoteConfig(ctx context.Context, client *http.Client, url string, key wgtypes.Key, reachableAt string, signingKey ed25519.PublicKey) (WgConfig, error) {
+	if err := relay.ValidateRemoteConfigURL(url); err != nil {
+		metrics.RecordRemoteConfigFetch("error")
+		return WgConfig{}, err
+	}
 	var body *bytes.Buffer
 	if reachableAt == "" {
 		body = bytes.NewBuffer([]byte(fmt.Sprintf(`{"publicKey": %q}`, key.PublicKey().String())))
 	} else {
 		body = bytes.NewBuffer([]byte(fmt.Sprintf(`{"publicKey": %q, "reachableAt": %q}`, key.PublicKey().String(), reachableAt)))
 	}
-	resp, err := http.Post(url, "application/json", body)
+	reqCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(reqCtx, http.MethodPost, url, body)
+	if err != nil {
+		metrics.RecordRemoteConfigFetch("error")
+		return WgConfig{}, fmt.Errorf("failed to create remote config request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
 	if err != nil {
 		// print the error
 		logger.Error("Error fetching remote config %s: %v", url, err)
@@ -807,10 +1085,24 @@ func loadRemoteConfig(url string, key wgtypes.Key, reachableAt string) (WgConfig
 	}
 	defer resp.Body.Close()
 
-	data, err := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		metrics.RecordRemoteConfigFetch("error")
+		return WgConfig{}, fmt.Errorf("remote config request failed with status %d", resp.StatusCode)
+	}
+
+	data, err := io.ReadAll(io.LimitReader(resp.Body, remoteConfigMaxBodyBytes+1))
 	if err != nil {
 		metrics.RecordRemoteConfigFetch("error")
 		return WgConfig{}, err
+	}
+	if int64(len(data)) > remoteConfigMaxBodyBytes {
+		metrics.RecordRemoteConfigFetch("error")
+		return WgConfig{}, fmt.Errorf("remote config response exceeds maximum allowed size")
+	}
+	signature, err := base64.StdEncoding.DecodeString(resp.Header.Get(remoteConfigSignatureHeader))
+	if len(signingKey) != ed25519.PublicKeySize || err != nil || !ed25519.Verify(signingKey, data, signature) {
+		metrics.RecordRemoteConfigFetch("error")
+		return WgConfig{}, fmt.Errorf("remote config signature verification failed")
 	}
 
 	var config WgConfig
@@ -1244,6 +1536,25 @@ func handlePeer(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+func requireControlAuth(next http.Handler) http.Handler {
+	controlTokenHash := sha256.Sum256([]byte(controlAPIToken))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		scheme, token, ok := strings.Cut(r.Header.Get("Authorization"), " ")
+		const maxTokenLen = 1024
+		if len(token) > maxTokenLen {
+			token = token[:maxTokenLen]
+		}
+		providedTokenHash := sha256.Sum256([]byte(token))
+		if !ok || !strings.EqualFold(scheme, "Bearer") || token == "" ||
+			subtle.ConstantTimeCompare(providedTokenHash[:], controlTokenHash[:]) != 1 {
+			w.Header().Set("WWW-Authenticate", "Bearer")
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 func handleHealthz(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
@@ -1601,14 +1912,14 @@ func handleUpdateLocalSNIs(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func periodicBandwidthCheck(ctx context.Context, endpoint string) error {
+func periodicBandwidthCheck(ctx context.Context, client *http.Client, endpoint string) error {
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ticker.C:
-			if err := reportPeerBandwidth(endpoint); err != nil {
+			if err := reportPeerBandwidth(ctx, client, endpoint); err != nil {
 				logger.Info("Failed to report peer bandwidth: %v", err)
 			}
 		case <-ctx.Done():
@@ -1729,7 +2040,7 @@ func loadBandwidthReportBatchSize() int {
 	return defaultBandwidthReportBatchSize
 }
 
-func reportPeerBandwidth(apiURL string) error {
+func reportPeerBandwidth(ctx context.Context, client *http.Client, apiURL string) error {
 	bandwidths, err := calculatePeerBandwidth()
 	if err != nil {
 		// Record bandwidth report error
@@ -1748,7 +2059,7 @@ func reportPeerBandwidth(apiURL string) error {
 			end = len(bandwidths)
 		}
 
-		if err := sendPeerBandwidthBatch(apiURL, bandwidths[start:end]); err != nil {
+		if err := sendPeerBandwidthBatch(ctx, client, apiURL, bandwidths[start:end]); err != nil {
 			metrics.RecordBandwidthReport("error")
 			batchErrs = append(batchErrs, err)
 			continue
@@ -1762,13 +2073,18 @@ func reportPeerBandwidth(apiURL string) error {
 	return nil
 }
 
-func sendPeerBandwidthBatch(apiURL string, batch []PeerBandwidth) error {
+func sendPeerBandwidthBatch(ctx context.Context, client *http.Client, apiURL string, batch []PeerBandwidth) error {
 	jsonData, err := json.Marshal(batch)
 	if err != nil {
 		return fmt.Errorf("failed to marshal bandwidth data: %v", err)
 	}
 
-	resp, err := http.Post(apiURL, "application/json", bytes.NewBuffer(jsonData))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, apiURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return fmt.Errorf("failed to create bandwidth request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("failed to send bandwidth data: %v", err)
 	}
