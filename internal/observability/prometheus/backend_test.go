@@ -116,13 +116,13 @@ func TestPrometheusBackendMultipleLabels(t *testing.T) {
 	}
 }
 
-func TestPrometheusBackendBoundsHTTPMethodLabels(t *testing.T) {
+func TestPrometheusBackendBoundsHTTPMethodLabelsForHTTPMetrics(t *testing.T) {
 	b := newTestBackend(t)
-	c, err := b.NewCounter("bounded_methods_total", "Bounded HTTP methods", "method")
+	c, err := b.NewCounter("gerbil_http_requests_total", "Bounded HTTP methods", "method")
 	if err != nil {
 		t.Fatalf("NewCounter returned error: %v", err)
 	}
-	h, err := b.NewHistogram("bounded_method_duration_seconds", "Bounded HTTP method durations", []float64{1}, "method")
+	h, err := b.NewHistogram("gerbil_http_request_duration_seconds", "Bounded HTTP method durations", []float64{1}, "method")
 	if err != nil {
 		t.Fatalf("NewHistogram returned error: %v", err)
 	}
@@ -133,10 +133,28 @@ func TestPrometheusBackendBoundsHTTPMethodLabels(t *testing.T) {
 	}
 
 	body := scrapeMetrics(t, b)
-	assertMetricPresent(t, body, `bounded_methods_total{method="other"} 2`)
-	assertMetricPresent(t, body, `bounded_method_duration_seconds_count{method="other"} 2`)
+	assertMetricPresent(t, body, `gerbil_http_requests_total{method="other"} 2`)
+	assertMetricPresent(t, body, `gerbil_http_request_duration_seconds_count{method="other"} 2`)
 	if strings.Contains(body, "CUSTOM-ONE") || strings.Contains(body, "CUSTOM-TWO") {
 		t.Errorf("unexpected unbounded HTTP method label in metrics output\nbody:\n%s", body)
+	}
+}
+
+func TestPrometheusBackendDoesNotBoundMethodForNonHTTPMetrics(t *testing.T) {
+	b := newTestBackend(t)
+	c, err := b.NewCounter("queue_methods_total", "Queue methods", "method")
+	if err != nil {
+		t.Fatalf("NewCounter returned error: %v", err)
+	}
+
+	c.Add(context.Background(), 1, map[string]string{"method": "CUSTOM-ONE"})
+	c.Add(context.Background(), 1, map[string]string{"method": "CUSTOM-TWO"})
+
+	body := scrapeMetrics(t, b)
+	assertMetricPresent(t, body, `queue_methods_total{method="CUSTOM-ONE"} 1`)
+	assertMetricPresent(t, body, `queue_methods_total{method="CUSTOM-TWO"} 1`)
+	if strings.Contains(body, `queue_methods_total{method="other"}`) {
+		t.Errorf("unexpected HTTP method normalization for non-HTTP metric\nbody:\n%s", body)
 	}
 }
 

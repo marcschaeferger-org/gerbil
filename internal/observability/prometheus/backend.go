@@ -7,6 +7,7 @@ package prometheus
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"net/http"
 
@@ -54,15 +55,19 @@ func New(cfg Config) (*Backend, error) {
 		Name: "gerbil_dropped_metric_samples_total",
 		Help: "Total number of metric samples dropped due to invalid labels or unsupported label sets",
 	})
-	registry.MustRegister(droppedSamplesCounter)
+	if err := registry.Register(droppedSamplesCounter); err != nil {
+		return nil, fmt.Errorf("register dropped samples counter: %w", err)
+	}
 
 	// Include Go and process metrics by default.
 	includeGo := cfg.IncludeGoMetrics == nil || *cfg.IncludeGoMetrics
 	if includeGo {
-		registry.MustRegister(
-			collectors.NewGoCollector(),
-			collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}),
-		)
+		if err := registry.Register(collectors.NewGoCollector()); err != nil {
+			return nil, fmt.Errorf("register Go collector: %w", err)
+		}
+		if err := registry.Register(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{})); err != nil {
+			return nil, fmt.Errorf("register process collector: %w", err)
+		}
 	}
 
 	handler := promhttp.HandlerFor(registry, promhttp.HandlerOpts{
@@ -96,11 +101,21 @@ func (b *Backend) NewCounter(name, desc string, labelNames ...string) (*Counter,
 			if !ok {
 				return nil, err
 			}
-			return &Counter{vec: existing, labelNames: append([]string(nil), labelNames...), droppedSamplesCounter: b.droppedSamplesCounter}, nil
+			return &Counter{
+				vec:                   existing,
+				labelNames:            append([]string(nil), labelNames...),
+				droppedSamplesCounter: b.droppedSamplesCounter,
+				valueNormalizers:      valueNormalizersForInstrument(name),
+			}, nil
 		}
 		return nil, err
 	}
-	return &Counter{vec: vec, labelNames: append([]string(nil), labelNames...), droppedSamplesCounter: b.droppedSamplesCounter}, nil
+	return &Counter{
+		vec:                   vec,
+		labelNames:            append([]string(nil), labelNames...),
+		droppedSamplesCounter: b.droppedSamplesCounter,
+		valueNormalizers:      valueNormalizersForInstrument(name),
+	}, nil
 }
 
 // NewUpDownCounter creates a Prometheus GaugeVec (Prometheus gauges are
@@ -174,11 +189,21 @@ func (b *Backend) NewHistogram(name, desc string, buckets []float64, labelNames 
 			if !ok {
 				return nil, err
 			}
-			return &Histogram{vec: existing, labelNames: append([]string(nil), labelNames...), droppedSamplesCounter: b.droppedSamplesCounter}, nil
+			return &Histogram{
+				vec:                   existing,
+				labelNames:            append([]string(nil), labelNames...),
+				droppedSamplesCounter: b.droppedSamplesCounter,
+				valueNormalizers:      valueNormalizersForInstrument(name),
+			}, nil
 		}
 		return nil, err
 	}
-	return &Histogram{vec: vec, labelNames: append([]string(nil), labelNames...), droppedSamplesCounter: b.droppedSamplesCounter}, nil
+	return &Histogram{
+		vec:                   vec,
+		labelNames:            append([]string(nil), labelNames...),
+		droppedSamplesCounter: b.droppedSamplesCounter,
+		valueNormalizers:      valueNormalizersForInstrument(name),
+	}, nil
 }
 
 // Counter is a native Prometheus counter instrument.
@@ -186,6 +211,7 @@ type Counter struct {
 	vec                   *prometheus.CounterVec
 	labelNames            []string
 	droppedSamplesCounter prometheus.Counter
+	valueNormalizers      map[string]func(string) string
 }
 
 // Add increments the counter by value for the given labels.
@@ -196,7 +222,7 @@ func (c *Counter) Add(_ context.Context, value int64, labels map[string]string) 
 		log.Printf("WARN: counter add called with negative value=%d labels=%v expected_labels=%v", value, labels, c.labelNames)
 		return
 	}
-	normalized, ok := normalizeLabels(c.labelNames, labels, c.droppedSamplesCounter)
+	normalized, ok := normalizeLabels(c.labelNames, labels, c.droppedSamplesCounter, c.valueNormalizers)
 	if !ok {
 		return
 	}
@@ -213,7 +239,7 @@ type UpDownCounter struct {
 
 // Add adjusts the gauge by value for the given labels.
 func (u *UpDownCounter) Add(_ context.Context, value int64, labels map[string]string) {
-	normalized, ok := normalizeLabels(u.labelNames, labels, u.droppedSamplesCounter)
+	normalized, ok := normalizeLabels(u.labelNames, labels, u.droppedSamplesCounter, nil)
 	if !ok {
 		return
 	}
@@ -230,7 +256,7 @@ type Int64Gauge struct {
 
 // Record sets the gauge to value for the given labels.
 func (g *Int64Gauge) Record(_ context.Context, value int64, labels map[string]string) {
-	normalized, ok := normalizeLabels(g.labelNames, labels, g.droppedSamplesCounter)
+	normalized, ok := normalizeLabels(g.labelNames, labels, g.droppedSamplesCounter, nil)
 	if !ok {
 		return
 	}
@@ -247,7 +273,7 @@ type Float64Gauge struct {
 
 // Record sets the gauge to value for the given labels.
 func (g *Float64Gauge) Record(_ context.Context, value float64, labels map[string]string) {
-	normalized, ok := normalizeLabels(g.labelNames, labels, g.droppedSamplesCounter)
+	normalized, ok := normalizeLabels(g.labelNames, labels, g.droppedSamplesCounter, nil)
 	if !ok {
 		return
 	}
@@ -260,11 +286,12 @@ type Histogram struct {
 	vec                   *prometheus.HistogramVec
 	labelNames            []string
 	droppedSamplesCounter prometheus.Counter
+	valueNormalizers      map[string]func(string) string
 }
 
 // Record observes value for the given labels.
 func (h *Histogram) Record(_ context.Context, value float64, labels map[string]string) {
-	normalized, ok := normalizeLabels(h.labelNames, labels, h.droppedSamplesCounter)
+	normalized, ok := normalizeLabels(h.labelNames, labels, h.droppedSamplesCounter, h.valueNormalizers)
 	if !ok {
 		return
 	}
@@ -272,7 +299,12 @@ func (h *Histogram) Record(_ context.Context, value float64, labels map[string]s
 	h.vec.With(normalized).Observe(value)
 }
 
-func normalizeLabels(labelNames []string, labels map[string]string, droppedSamplesCounter prometheus.Counter) (prometheus.Labels, bool) {
+func normalizeLabels(
+	labelNames []string,
+	labels map[string]string,
+	droppedSamplesCounter prometheus.Counter,
+	valueNormalizers map[string]func(string) string,
+) (prometheus.Labels, bool) {
 	if len(labelNames) == 0 {
 		if len(labels) > 0 {
 			if droppedSamplesCounter != nil {
@@ -297,13 +329,22 @@ func normalizeLabels(labelNames []string, labels map[string]string, droppedSampl
 			log.Printf("WARN: dropping metric sample due to unexpected label key %q (expected=%v)", k, labelNames)
 			return nil, false
 		}
-		if k == "method" {
-			v = normalizeHTTPMethod(v)
+		if normalizeValue, ok := valueNormalizers[k]; ok && normalizeValue != nil {
+			v = normalizeValue(v)
 		}
 		normalized[k] = v
 	}
 
 	return normalized, true
+}
+
+func valueNormalizersForInstrument(name string) map[string]func(string) string {
+	switch name {
+	case "gerbil_http_requests_total", "gerbil_http_request_duration_seconds":
+		return map[string]func(string) string{"method": normalizeHTTPMethod}
+	default:
+		return nil
+	}
 }
 
 func normalizeHTTPMethod(method string) string {
