@@ -64,7 +64,7 @@ Important:
 - `reachableAt`: How should the remote server reach Gerbil's API?
 - `generateAndSaveKeyTo`: Where to save the generated WireGuard private key to persist across restarts.
 - `remoteConfig`: HTTPS endpoint used to retrieve the JSON configuration.
-- `allow-insecure-remote-config` (optional): Allow plaintext HTTP remote config for development only. Default: `false`
+- `remote-config-signing-key`: Base64-encoded Ed25519 public key used to verify remote configuration responses.
 - `sni-proxy-allowed-cidrs` (optional): Comma-separated CIDRs allowed as remote SNI proxy targets. Remote targets are rejected when this is unset.
 
 Others:
@@ -86,7 +86,7 @@ All CLI arguments can also be provided via environment variables:
 
 - `INTERFACE`: Name of the WireGuard interface
 - `REMOTE_CONFIG`: URL of the remote config server
-- `ALLOW_INSECURE_REMOTE_CONFIG`: Allow plaintext HTTP remote config for development only (`true`/`false`)
+- `REMOTE_CONFIG_SIGNING_KEY`: Base64-encoded Ed25519 public key used to verify the signature in the `X-Gerbil-Config-Signature` response header. The signature must cover the exact response body.
 - `SNI_PROXY_ALLOWED_CIDRS`: Comma-separated CIDRs allowed as remote SNI proxy targets
 - `LISTEN`: Address to listen on for the HTTP server (private/loopback addresses only; wildcard and public addresses are rejected; default `127.0.0.1:3003`)
 - `CONTROL_API_TOKEN`: ****** for control-plane mutation endpoints (required; at least 32 characters)
@@ -111,6 +111,7 @@ Set `CONTROL_API_TOKEN` to a shared random secret and `LISTEN` to the Gerbil hos
 --reachableAt=http://gerbil:3004 \
 --generateAndSaveKeyTo=/var/config/key \
 --remoteConfig=https://pangolin:3001/api/v1/ \
+--remote-config-signing-key=${REMOTE_CONFIG_SIGNING_KEY} \
 --sni-proxy-allowed-cidrs=203.0.113.0/24
 ```
 
@@ -123,6 +124,7 @@ services:
     environment:
       LISTEN: gerbil:3004
       CONTROL_API_TOKEN: ${CONTROL_API_TOKEN}
+      REMOTE_CONFIG_SIGNING_KEY: ${REMOTE_CONFIG_SIGNING_KEY}
     command:
       - --reachableAt=http://gerbil:3004
       - --generateAndSaveKeyTo=/var/config/key

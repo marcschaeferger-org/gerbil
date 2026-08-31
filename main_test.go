@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/base64"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -12,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/fosrl/gerbil/relay"
 	"golang.zx2c4.com/wireguard/wgctrl/wgtypes"
 )
 
@@ -61,6 +65,8 @@ func TestRequireControlAuth(t *testing.T) {
 	}
 	if !called {
 		t.Fatal("authenticated request did not reach protected handler")
+	}
+}
 
 func TestLoadRemoteConfigRejectsRedirect(t *testing.T) {
 	var redirected atomic.Bool
@@ -74,16 +80,18 @@ func TestLoadRemoteConfigRejectsRedirect(t *testing.T) {
 	}))
 	defer redirectSource.Close()
 
-	originalClient := remoteConfigHTTPClient
-	remoteConfigHTTPClient = redirectSource.Client()
-	remoteConfigHTTPClient.CheckRedirect = originalClient.CheckRedirect
-	defer func() { remoteConfigHTTPClient = originalClient }()
+	client := redirectSource.Client()
+	client.CheckRedirect = relay.NewControlPlaneHTTPClient().CheckRedirect
 
 	key, err := wgtypes.GeneratePrivateKey()
 	if err != nil {
 		t.Fatalf("failed to generate key: %v", err)
 	}
-	if _, err := loadRemoteConfig(redirectSource.URL, key, ""); err == nil {
+	signingKey, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadRemoteConfig(context.Background(), client, redirectSource.URL, key, "", signingKey); err == nil {
 		t.Fatal("expected redirected remote config request to fail")
 	}
 	if redirected.Load() {
@@ -91,32 +99,106 @@ func TestLoadRemoteConfigRejectsRedirect(t *testing.T) {
 	}
 }
 
-func TestLoadRemoteConfigTimesOut(t *testing.T) {
-	if remoteConfigHTTPClient.Timeout <= 0 {
-		t.Fatal("remote config client must have a finite timeout")
-	}
+func TestLoadRemoteConfigRejectsHTTP(t *testing.T) {
+	var contacted atomic.Bool
+	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
+		contacted.Store(true)
+	}))
+	defer server.Close()
 
+	key, err := wgtypes.GeneratePrivateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	signingKey, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := loadRemoteConfig(context.Background(), server.Client(), server.URL, key, "", signingKey); err == nil {
+		t.Fatal("expected plaintext HTTP remote config to be rejected")
+	}
+	if contacted.Load() {
+		t.Fatal("insecure remote config server was contacted")
+	}
+}
+
+func TestLoadRemoteConfigTimesOut(t *testing.T) {
 	stalled := httptest.NewTLSServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
 		time.Sleep(250 * time.Millisecond)
 	}))
 	defer stalled.Close()
 
-	originalClient := remoteConfigHTTPClient
-	remoteConfigHTTPClient = stalled.Client()
-	remoteConfigHTTPClient.Timeout = 25 * time.Millisecond
-	remoteConfigHTTPClient.CheckRedirect = originalClient.CheckRedirect
-	defer func() { remoteConfigHTTPClient = originalClient }()
+	client := stalled.Client()
+	client.Timeout = 25 * time.Millisecond
 
 	key, err := wgtypes.GeneratePrivateKey()
 	if err != nil {
 		t.Fatalf("failed to generate key: %v", err)
 	}
+	signingKey, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
 	started := time.Now()
-	if _, err := loadRemoteConfig(stalled.URL, key, ""); err == nil {
+	if _, err := loadRemoteConfig(context.Background(), client, stalled.URL, key, "", signingKey); err == nil {
 		t.Fatal("expected stalled remote config request to time out")
 	}
 	if elapsed := time.Since(started); elapsed >= 200*time.Millisecond {
 		t.Fatalf("remote config request exceeded its timeout: %v", elapsed)
+	}
+}
+
+func TestLoadRemoteConfigVerifiesSignature(t *testing.T) {
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := []byte(`{"listenPort":51820,"peers":[]}`)
+
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set(remoteConfigSignatureHeader, base64.StdEncoding.EncodeToString(ed25519.Sign(privateKey, body)))
+		_, _ = w.Write(body)
+	}))
+	defer server.Close()
+
+	key, err := wgtypes.GeneratePrivateKey()
+	if err != nil {
+		t.Fatal(err)
+	}
+	config, err := loadRemoteConfig(context.Background(), server.Client(), server.URL, key, "", publicKey)
+	if err != nil {
+		t.Fatalf("loadRemoteConfig() error = %v", err)
+	}
+	if config.ListenPort != 51820 {
+		t.Fatalf("ListenPort = %d, want 51820", config.ListenPort)
+	}
+
+	server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set(remoteConfigSignatureHeader, base64.StdEncoding.EncodeToString(ed25519.Sign(privateKey, body)))
+		_, _ = w.Write(append(body, ' '))
+	})
+	if _, err := loadRemoteConfig(context.Background(), server.Client(), server.URL, key, "", publicKey); err == nil {
+		t.Fatal("expected modified remote config to fail signature verification")
+	}
+}
+
+func TestParseRemoteConfigSigningKey(t *testing.T) {
+	publicKey, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded := base64.StdEncoding.EncodeToString(publicKey)
+	parsed, err := parseRemoteConfigSigningKey(encoded)
+	if err != nil {
+		t.Fatalf("parseRemoteConfigSigningKey() error = %v", err)
+	}
+	if !parsed.Equal(publicKey) {
+		t.Fatal("parsed signing key does not match input")
+	}
+	for _, invalid := range []string{"", "not-base64", base64.StdEncoding.EncodeToString([]byte("short"))} {
+		if _, err := parseRemoteConfigSigningKey(invalid); err == nil {
+			t.Fatalf("parseRemoteConfigSigningKey(%q) succeeded", invalid)
+		}
 	}
 }
 
@@ -277,3 +359,5 @@ func TestLoadOrGeneratePrivateKeyRejectsInsecureExistingFile(t *testing.T) {
 	_, err = loadOrGeneratePrivateKey(path)
 	if err == nil || !strings.Contains(err.Error(), "insecure permissions") {
 		t.Fatalf("loadOrGeneratePrivateKey() error = %v, want insecure permissions error", err)
+	}
+}
