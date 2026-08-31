@@ -916,11 +916,11 @@ func main() {
 
 	// Register metrics endpoint only for Prometheus backend.
 	// OTel backend pushes to a collector; no /metrics endpoint needed.
-	// Note: metricsPath is registered directly without httpMetricsMiddleware to prevent infinite recursion.
-	// The metricsHandler must not be wrapped by the middleware, as it would observe its own observation calls.
+	// Note: metricsPath must not be wrapped by httpMetricsMiddleware to prevent infinite recursion.
+	// The metricsHandler would otherwise observe its own observation calls.
 	if metricsHandler != nil {
-		apiMux.Handle(metricsPath, metricsHandler)
-		logger.Info("Metrics endpoint enabled at %s", metricsPath)
+		apiMux.Handle(metricsPath, requireControlAuth(metricsHandler))
+		logger.Info("Authenticated metrics endpoint enabled at %s", metricsPath)
 	}
 
 	listener, err := net.Listen("tcp", listenAddr)
