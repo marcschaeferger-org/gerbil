@@ -26,6 +26,11 @@ import (
 
 const relayIfname = "relay"
 
+const (
+	endpointCacheTTL        = 2500 * time.Millisecond
+	maxEndpointCacheEntries = 10000
+)
+
 type EncryptedHolePunchMessage struct {
 	EphemeralPublicKey string `json:"ephemeralPublicKey"`
 	Nonce              []byte `json:"nonce"`
@@ -182,6 +187,61 @@ type cachedEndpointEntry struct {
 	cachedAt time.Time
 }
 
+// endpointCache bounds attacker-controlled identity state retained by the relay.
+type endpointCache struct {
+	mu         sync.Mutex
+	entries    map[string]cachedEndpointEntry
+	maxEntries int
+	ttl        time.Duration
+}
+
+func newEndpointCache(maxEntries int, ttl time.Duration) *endpointCache {
+	return &endpointCache{
+		entries:    make(map[string]cachedEndpointEntry, maxEntries),
+		maxEntries: maxEntries,
+		ttl:        ttl,
+	}
+}
+
+func (c *endpointCache) Load(key string) (cachedEndpointEntry, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	entry, ok := c.entries[key]
+	if ok && time.Since(entry.cachedAt) >= c.ttl {
+		delete(c.entries, key)
+		return cachedEndpointEntry{}, false
+	}
+	return entry, ok
+}
+
+func (c *endpointCache) Store(key string, entry cachedEndpointEntry) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if c.maxEntries <= 0 {
+		return
+	}
+	if _, exists := c.entries[key]; !exists && len(c.entries) >= c.maxEntries {
+		for evictionKey := range c.entries {
+			delete(c.entries, evictionKey)
+			break
+		}
+	}
+	c.entries[key] = entry
+}
+
+func (c *endpointCache) DeleteExpired(now time.Time) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	for key, entry := range c.entries {
+		if now.Sub(entry.cachedAt) >= c.ttl {
+			delete(c.entries, key)
+		}
+	}
+}
+
 // --- End Types ---
 
 // bufferPool allows reusing buffers to reduce allocations.
@@ -215,14 +275,14 @@ type UDPProxyServer struct {
 	// Communication pattern tracking for rebuilding sessions
 	// Key format: "clientIP:clientPort-destIP:destPort"
 	commPatterns sync.Map
-	// Rate limiter for encrypted hole punch messages, keyed by "ip:port"
+	// Rate limiter for encrypted hole punch messages, keyed by source IP.
 	holePunchRateLimiter sync.Map
 	// Cache for resolved UDP addresses to avoid per-packet DNS lookups
 	// Key: "ip:port" string, Value: *net.UDPAddr
 	addrCache sync.Map
-	// lastEndpointCache stores the last-known endpoint state per client (key: olmId:newtId)
-	// used to skip redundant HTTP notifications when nothing has changed.
-	lastEndpointCache sync.Map
+	// lastEndpointCache stores a bounded set of last-known endpoint states per client
+	// (key: olmId:newtId), used to skip redundant HTTP notifications.
+	lastEndpointCache *endpointCache
 	// notifyChan is the async queue for hole-punch endpoint notifications.
 	// Dedicated notifier workers drain this channel and perform the HTTP call.
 	notifyChan chan ClientEndpoint
@@ -234,14 +294,15 @@ type UDPProxyServer struct {
 func NewUDPProxyServer(parentCtx context.Context, addr, serverURL string, privateKey wgtypes.Key, reachableAt string) *UDPProxyServer {
 	ctx, cancel := context.WithCancel(parentCtx)
 	return &UDPProxyServer{
-		addr:        addr,
-		serverURL:   serverURL,
-		privateKey:  privateKey,
-		packetChan:  make(chan Packet, 50000), // Increased from 1000 to handle high throughput
-		notifyChan:  make(chan ClientEndpoint, 1000),
-		ReachableAt: reachableAt,
-		ctx:         ctx,
-		cancel:      cancel,
+		addr:              addr,
+		serverURL:         serverURL,
+		privateKey:        privateKey,
+		packetChan:        make(chan Packet, 50000), // Increased from 1000 to handle high throughput
+		lastEndpointCache: newEndpointCache(maxEndpointCacheEntries, endpointCacheTTL),
+		notifyChan:        make(chan ClientEndpoint, 1000),
+		ReachableAt:       reachableAt,
+		ctx:               ctx,
+		cancel:            cancel,
 	}
 }
 
@@ -296,6 +357,9 @@ func (s *UDPProxyServer) Start() error {
 
 	// Start the hole punch rate limiter cleanup routine
 	go s.cleanupHolePunchRateLimiter()
+
+	// Start the endpoint cache cleanup routine.
+	go s.cleanupEndpointCache()
 
 	// Start async endpoint notifier workers (HTTP calls off the hot path)
 	for i := 0; i < 5; i++ {
@@ -368,8 +432,8 @@ func (s *UDPProxyServer) packetWorker() {
 		} else {
 			metrics.RecordUDPPacket(relayIfname, "hole_punch", "in")
 			metrics.RecordUDPPacketSize(relayIfname, "hole_punch", float64(packet.n))
-			// Rate limit: allow at most 2 hole punch messages per IP:Port per second
-			rateLimitKey := packet.remoteAddr.String()
+			// Rate limit: allow at most 2 hole punch messages per source IP per second.
+			rateLimitKey := packet.remoteAddr.IP.String()
 			entryVal, _ := s.holePunchRateLimiter.LoadOrStore(rateLimitKey, &holePunchRateLimitEntry{
 				windowStart: time.Now(),
 			})
@@ -444,7 +508,6 @@ func (s *UDPProxyServer) packetWorker() {
 			// Check if anything meaningful changed before queuing an HTTP notification.
 			// The cache expires after 2.5 s so the server always receives a fresh
 			// timestamp within its 5-second staleness window.
-			const endpointCacheTTL = 2500 * time.Millisecond
 			cacheKey := endpoint.OlmID + ":" + endpoint.NewtID
 			newState := cachedEndpointState{
 				OlmID:     endpoint.OlmID,
@@ -454,9 +517,8 @@ func (s *UDPProxyServer) packetWorker() {
 				Port:      endpoint.Port,
 				PublicKey: endpoint.ClientPublicKey,
 			}
-			if cached, ok := s.lastEndpointCache.Load(cacheKey); ok {
-				entry := cached.(cachedEndpointEntry)
-				if entry.state == newState && time.Since(entry.cachedAt) < endpointCacheTTL {
+			if entry, ok := s.lastEndpointCache.Load(cacheKey); ok {
+				if entry.state == newState {
 					// Endpoint unchanged and cache still fresh - skip the HTTP call.
 					logger.Debug("Endpoint unchanged for %s, skipping notification", cacheKey)
 					metrics.RecordHolePunchEvent(relayIfname, "deduplicated")
@@ -466,8 +528,6 @@ func (s *UDPProxyServer) packetWorker() {
 					continue
 				}
 			}
-			s.lastEndpointCache.Store(cacheKey, cachedEndpointEntry{state: newState, cachedAt: time.Now()})
-
 			// Queue the notification asynchronously so the hot path is not blocked by HTTP.
 			select {
 			case s.notifyChan <- endpoint:
@@ -1136,6 +1196,21 @@ func (s *UDPProxyServer) notifyServer(endpoint ClientEndpoint) {
 	}
 	s.proxyMappings.Store(key, mapping)
 
+	// Retain identity-keyed state only after the upstream service has authenticated
+	// the request and accepted the endpoint.
+	cacheKey := endpoint.OlmID + ":" + endpoint.NewtID
+	s.lastEndpointCache.Store(cacheKey, cachedEndpointEntry{
+		state: cachedEndpointState{
+			OlmID:     endpoint.OlmID,
+			NewtID:    endpoint.NewtID,
+			Token:     endpoint.Token,
+			IP:        endpoint.IP,
+			Port:      endpoint.Port,
+			PublicKey: endpoint.ClientPublicKey,
+		},
+		cachedAt: time.Now(),
+	})
+
 	logger.Debug("Stored proxy mapping for %s with %d destinations (timestamp: %v)", key, len(mapping.Destinations), mapping.LastUsed)
 }
 
@@ -1464,6 +1539,19 @@ func (s *UDPProxyServer) cleanupHolePunchRateLimiter() {
 				}
 				return true
 			})
+		case <-s.ctx.Done():
+			return
+		}
+	}
+}
+
+func (s *UDPProxyServer) cleanupEndpointCache() {
+	ticker := time.NewTicker(endpointCacheTTL)
+	defer ticker.Stop()
+	for {
+		select {
+		case now := <-ticker.C:
+			s.lastEndpointCache.DeleteExpired(now)
 		case <-s.ctx.Done():
 			return
 		}
